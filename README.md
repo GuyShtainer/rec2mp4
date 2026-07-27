@@ -1,5 +1,7 @@
 # rec2mp4
 
+[![ci](https://github.com/GuyShtainer/rec2mp4/actions/workflows/ci.yml/badge.svg)](https://github.com/GuyShtainer/rec2mp4/actions/workflows/ci.yml)
+
 Turn Pokémon Emerald **Battle Record** exports (`.rec`) into `.mp4` videos.
 
 A `.rec` file is a raw dump of save **sector 31** (4096 bytes) — the Frontier Pass
@@ -28,7 +30,8 @@ Detail of what that covers:
 - **Parser / validator / injector (`rec2mp4.rec`)** — verified against the 10
   real records, plus corruption tests (checksum, sentinel, forbidden
   battle-flag bits, truncation) and an inject round-trip. Pure stdlib, tested
-  on Python 3.12–3.14 (97 checks passing).
+  on Python 3.12–3.14 (110 checks passing; 54 in the asset-free synthetic
+  mode CI runs).
 - **`--info-only` CLI** — summarizes records with no emulator, ffmpeg, ROM or
   save needed.
 - **Emulator driver + encoder (`rec2mp4.driver` / `rec2mp4.video`)** — the full
@@ -64,12 +67,30 @@ original EZ-Flash cart backup that first sat at that path turned out to be an
 is needed if that cart's real save is ever wanted. Full findings:
 `docs/research/save-check.md`.
 
-## Setup (macOS)
+## Setup
 
-Verified on macOS arm64 (Apple Silicon). The emulator core is
-[hanzi/libmgba-py](https://github.com/hanzi/libmgba-py) (prebuilt mGBA Python
-bindings, MPL-2.0), fetched into the gitignored `vendor/` directory — never
-committed. Full rationale and fallbacks: `docs/research/emulator-stack.md`.
+The emulator core is [hanzi/libmgba-py](https://github.com/hanzi/libmgba-py)
+(prebuilt mGBA Python bindings, MPL-2.0), fetched into the gitignored
+`vendor/` directory — never committed. One script does the whole fetch on
+macOS (arm64/Intel), Windows x64 and Linux x64, including the macOS
+rpath/dylib fix-ups, and ends with an `import mgba.core` smoke test:
+
+```bash
+# system deps first — macOS: brew install ffmpeg mgba
+#                     Windows: choco install ffmpeg   (the mGBA DLL is bundled)
+#                     Linux:   sudo apt install ffmpeg
+python tools/fetch_bindings.py     # idempotent; safe to re-run any time
+python -m pip install pillow numpy # optional: headed-mode PNG previews
+```
+
+The replay itself was validated on macOS arm64 with Python 3.13 (a dedicated
+env is tidy but not required: `conda create -n rec2mp4 python=3.13`). The
+bindings are `abi3` builds, so any CPython ≥ 3.10 should load them — CI
+imports them on Python 3.12 on Windows and macOS. `--info-only` and the
+tests need none of this — pure stdlib, any Python ≥ 3.10.
+
+<details>
+<summary>Appendix: manual macOS setup (what the script automates)</summary>
 
 ```bash
 # 0) system deps (Homebrew)
@@ -98,7 +119,7 @@ cd ..
   "import sys; sys.path.insert(0,'vendor'); import mgba.core; print('ok')"
 ```
 
-`--info-only` needs none of the above — any Python ≥ 3.10 will do.
+</details>
 
 ## Usage
 
@@ -108,7 +129,9 @@ Run from the project root (or `pip install -e .` for a `rec2mp4` command):
 # Inspect a record — no emulator, ROM or save required
 python3 -m rec2mp4 local/recs/GUYA_27-07-2026_08-54.rec --info-only
 
-# Convert a single record to out/<basename>.mp4
+# Convert a single record. Output name carries the battle's data, e.g.
+#   out/GUYA_27-07-2026_08-54 - Battle Arena Open vs SAILOR MAXWELL.mp4
+# plus a matching .json sidecar (see "Output names & the JSON sidecar")
 python3 -m rec2mp4 local/recs/GUYA_27-07-2026_08-54.rec \
     --sav local/alt-saves/all-shiny.sav
 
@@ -129,9 +152,42 @@ python3 -m rec2mp4 my.rec --anims record --text-speed record
 Options: `-o/--outdir` (default `out/`), `--rom` (default `local/rom.gba`),
 `--sav` (default `local/template.sav`), `--headed`, `--scale N`, `--no-audio`,
 `--anims on|off|record` (default `on`), `--text-speed slow|mid|fast|record`
-(default `record`), `--info-only`, `--max-seconds N` (replay timeout, default
-1800), `--pix-fmt` (raw-framebuffer format handed to ffmpeg, default `rgb0`).
+(default `record`), `--plain-names`, `--no-sidecar`, `--info-only`,
+`--max-seconds N` (replay timeout, default 1800), `--pix-fmt`
+(raw-framebuffer format handed to ffmpeg, default `rgb0`).
 Exit code is non-zero if any record fails.
+
+### Output names & the JSON sidecar
+
+By default each video is named with the battle's own data:
+
+```
+<stem> - <Facility> <Open|Lv50>[ <double|multi|two-opponents|link>] vs <Opponent>[ and <OpponentB>].mp4
+e.g.  GUYA_19-07-2026_10-09 - Battle Dome Open double vs SAILOR MAXWELL.mp4
+```
+
+Battle Frontier opponent names (`SAILOR MAXWELL`, ...) are **read from your
+own ROM at runtime** — no trainer names, game text or other Game Freak data
+ship with this tool, only ROM addresses and struct layouts. If a name can't
+be resolved with certainty, the tool falls back to a descriptive label
+(`frontier trainer 83`, the record-mix friend's name stored in the record
+itself, `Apprentice N`, `Frontier Brain`). Names are sanitized to ASCII,
+Windows-safe characters. Re-converting the same record overwrites its own
+output; if the target name already exists from a *different* record, a
+` (2)`, ` (3)` ... suffix is appended instead. `--plain-names` restores the
+old `<stem>.mp4` naming.
+
+Next to every converted (or timeout-truncated) video, a `<same basename>.json`
+sidecar preserves everything known about the conversion: the full parsed
+record (facility, level mode, battle flags, players, both teams, RNG seed,
+input-lane sizes, opponents), the source `.rec` filename and the SHA-1 of its
+4096 bytes, the ROM's CRC32, the options used (`anims`/`text-speed`/`scale`/
+audio/`pix-fmt`), the replay result (frames, seconds, end reason) **and the
+battle outcome** (`won`/`lost`/`draw`, read from the game's own
+`gBattleOutcome` during playback), plus the rec2mp4 version and an ISO-8601
+timestamp. Sidecars inherit the record's privacy caveats (player names,
+trainer IDs, teams) — share them as deliberately as the videos. Disable with
+`--no-sidecar`.
 
 **About `--anims`:** the record stores a snapshot of the *recorder's* in-game
 options (struct byte +1279); someone who battled with BATTLE SCENE OFF gets
@@ -145,16 +201,28 @@ per decision, not per frame. Verified empirically: the same record converted
 with animations off (59.4 s) and on (73.6 s) reaches the same outcome with
 identical HP trajectories.
 
-## Windows notes (untested)
+## Windows notes
 
-The whole pipeline has only ever been exercised on macOS arm64. That said,
-nothing is macOS-specific in principle: libmgba-py release `0.2.0-2` also ships
-a prebuilt `win64` zip (the [pokebot-gen3](https://github.com/40Cakes/pokebot-gen3)
-project fetches and runs it on Windows daily — follow its setup for the
-matching libmgba DLL), and ffmpeg is available via `winget`/`choco`. The
-`install_name_tool` steps are macOS-only; on Windows the DLL just needs to be
-next to the extension module. BizHawk remains a manual, Windows-only fallback
-for capturing a replay by hand. Contributions welcome.
+The **full replay** has only ever been exercised end-to-end on macOS arm64,
+but the Windows plumbing is CI-validated on every push (`windows-latest`,
+Python 3.12 — see the badge above):
+
+- **Covered by CI on Windows:** the whole parser/validator/injector suite and
+  the naming/sidecar suite (`tests/test_rec.py` in synthetic mode,
+  `tests/test_naming.py`); the real ffmpeg encode path
+  (`python -m rec2mp4.video` self-test, ffmpeg via choco); and the emulator
+  bindings — `tools/fetch_bindings.py` downloads the libmgba-py `0.2.0-2`
+  `win64` zip (which bundles `mgba.dll` and every dependency DLL — the same
+  zip [pokebot-gen3](https://github.com/40Cakes/pokebot-gen3) runs on Windows
+  daily) and proves `import mgba.core` works. The driver also calls
+  `os.add_dll_directory(vendor/mgba)` on Windows before importing.
+- **Still manual, by design:** the full replay (boot → menus → playback →
+  MP4) needs your own US Emerald ROM, post-game save and `.rec` files, which
+  CI never has. Run it yourself with
+  `python -m rec2mp4 my.rec --rom local\rom.gba --sav local\template.sav`
+  and please report how it goes. BizHawk remains a manual, Windows-only
+  fallback for capturing a replay by hand. Non-US ROMs stay unsupported (the
+  RAM addresses are US-specific). Contributions welcome.
 
 ## How it works
 
