@@ -52,11 +52,34 @@ under that env's python:
   ~/miniconda3/envs/rec2mp4/bin/python -m rec2mp4 ..."""
 
 
+# gBattleOutcome values — B_OUTCOME_* in the decomp's
+# include/constants/battle.h:100-110 (WON=1, LOST=2, DREW=3, RAN=4,
+# PLAYER_TELEPORTED=5, MON_FLED=6, CAUGHT=7, NO_SAFARI_BALLS=8,
+# FORFEITED=9, MON_TELEPORTED=10, LINK_BATTLE_RAN=128). From the
+# perspective of the recorder's side.
+OUTCOME_TEXT = {
+    0: "unknown",
+    1: "won",
+    2: "lost",
+    3: "draw",
+    4: "ran",
+    5: "player teleported",
+    6: "mon fled",
+    7: "caught",
+    8: "no safari balls",
+    9: "forfeited",
+    10: "mon teleported",
+    128: "link battle ran",
+}
+
+
 @dataclass
 class ReplayResult:
     frames: int       # video frames streamed to on_frame (replay only)
     seconds: float    # frames / exact GBA frame rate
     end_reason: str   # 'natural' | 'timeout' | 'error:<step>'
+    outcome: int = 0  # first nonzero gBattleOutcome seen (0 = never decided)
+    outcome_text: str = "unknown"   # OUTCOME_TEXT[outcome]
 
 
 class _StepStall(Exception):
@@ -114,6 +137,13 @@ class EmulatorDriver:
         # --- lazy import of the emulator bindings ------------------------
         if _VENDOR_DIR.is_dir() and str(_VENDOR_DIR) not in sys.path:
             sys.path.insert(0, str(_VENDOR_DIR))
+        if sys.platform == "win32":
+            # The win64 bindings zip bundles mgba.dll (+ dependency DLLs)
+            # next to _pylib.pyd; Python 3.8+ on Windows no longer searches
+            # PATH/sys.path for an extension module's DLL dependencies.
+            _dll_dir = _VENDOR_DIR / "mgba"
+            if _dll_dir.is_dir():
+                os.add_dll_directory(str(_dll_dir))
         try:
             import mgba.core    # noqa: F401
             import mgba.image   # noqa: F401
@@ -197,6 +227,7 @@ class EmulatorDriver:
         self._max_frames = max(1, int(max_seconds * S.FRAME_RATE))
         self._capturing = False
         self._captured = 0
+        self._outcome = 0
 
         try:
             self._step_boot_to_intro()
@@ -226,10 +257,14 @@ class EmulatorDriver:
             self._on_audio = None
 
         seconds = self._captured / S.FRAME_RATE
+        outcome = self._outcome
+        outcome_text = OUTCOME_TEXT.get(outcome, f"outcome {outcome}")
         self._log(f"replay done: {self._captured} frames "
-                  f"({seconds:.2f}s), end_reason={end_reason}")
+                  f"({seconds:.2f}s), end_reason={end_reason}, "
+                  f"outcome={outcome} ({outcome_text})")
         return ReplayResult(frames=self._captured, seconds=seconds,
-                            end_reason=end_reason)
+                            end_reason=end_reason, outcome=outcome,
+                            outcome_text=outcome_text)
 
     def close(self):
         if self._closed:
@@ -571,18 +606,21 @@ class EmulatorDriver:
 
     def _step_wait_battle_end(self):
         # Whitelist poll (replay-path §3); bounded only by max_seconds.
-        outcome_logged = False
         last_progress = self._frames_run
         while True:
             cb2 = self._cb2()
             if cb2 in S.REPLAY_END_CALLBACKS_T:
                 break
-            if not outcome_logged:
+            if self._outcome == 0:
+                # Capture the FIRST nonzero gBattleOutcome (B_OUTCOME_*):
+                # the game zeroes it again on battle teardown, so a poll
+                # after the whitelist hit would be too late.
                 outcome = self._u8(S.GBATTLE_OUTCOME)
                 if outcome:
+                    self._outcome = outcome
                     self._log(f"[f{self._frames_run}] battle outcome decided: "
-                              f"{outcome} (1=won 2=lost)")
-                    outcome_logged = True
+                              f"{outcome} "
+                              f"({OUTCOME_TEXT.get(outcome, '?')})")
             if self._frames_run - last_progress >= 600:
                 last_progress = self._frames_run
                 self._log(f"[f{self._frames_run}] battle in progress "
