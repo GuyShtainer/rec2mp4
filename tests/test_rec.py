@@ -5,8 +5,16 @@
 
 Run:  python3 tests/test_rec.py
 
-Uses the real (gitignored) assets in local/: recs/*.rec and template.sav.
-Sections that need an absent asset are skipped with a message.
+With the real (gitignored) assets in local/ (recs/*.rec and template.sav)
+every section runs against them, exactly as always. Without them (fresh
+clone, CI) the suite prints 'SYNTHETIC MODE' and runs the FULL set of
+sections — validate/parse sanity, corruption, patch_options and inject —
+on a from-scratch record built with the real sentinel/encryption/checksum
+scheme plus a synthetic 128 KiB save image, so CI still exercises real
+assertions (exit 0 on success). Exit 2 is reserved for runs where required
+assets are missing AND nothing meaningful could run — or for strict local
+runs with REC2MP4_REQUIRE_ASSETS=1, which fail (exit 2) whenever any
+real-asset section had to be skipped or substituted.
 """
 
 import glob
@@ -40,6 +48,149 @@ def fix_checksum(buf: bytearray) -> None:
     s = sum(buf[rec.STRUCT_OFF:rec.STRUCT_OFF + rec.CHECKSUM_RANGE]) \
         & 0xFFFFFFFF
     struct.pack_into("<I", buf, rec.STRUCT_OFF + rec.CHECKSUM_RANGE, s)
+
+
+# ---------------------------------------------------------------------------
+# Synthetic assets (used only when local/ is absent — fresh clone / CI).
+# Everything is built from scratch with the byte-exact scheme rec.py decodes:
+# Gen-3 charset names, XOR-encrypted party mons in the personality-dependent
+# substruct order with the 16-bit word-sum checksum, and the struct's u32
+# byte-sum checksum. rec.validate() must return [] for the result.
+# ---------------------------------------------------------------------------
+
+_G3_SPECIALS = {' ': 0x00, '!': 0xAB, '?': 0xAC, '.': 0xAD, '-': 0xAE,
+                "'": 0xB4, ',': 0xB8, '/': 0xBA, ':': 0xF0}
+
+
+def g3_encode(text: str) -> bytes:
+    """Encode ASCII to the Gen-3 charset subset rec._g3chr() decodes."""
+    out = bytearray()
+    for c in text:
+        if 'A' <= c <= 'Z':
+            out.append(0xBB + ord(c) - ord('A'))
+        elif 'a' <= c <= 'z':
+            out.append(0xD5 + ord(c) - ord('a'))
+        elif '0' <= c <= '9':
+            out.append(0xA1 + ord(c) - ord('0'))
+        else:
+            out.append(_G3_SPECIALS[c])
+    return bytes(out)
+
+
+def build_synthetic_mon(pers: int, otid: int, nickname: str,
+                        species: int, level: int) -> bytes:
+    """One 100-byte encrypted party mon, reversing rec._decode_mon()."""
+    m = bytearray(100)
+    struct.pack_into("<II", m, 0, pers, otid)
+    name = g3_encode(nickname)[:10]
+    m[8:8 + len(name)] = name
+    for i in range(8 + len(name), 18):
+        m[i] = 0xFF                                   # EOS + padding
+    # 48-byte plaintext substruct block; Growth position depends on pers%24.
+    plain = bytearray(48)
+    order = rec._ORDERS[pers % 24]
+    struct.pack_into("<H", plain, order.index('G') * 12, species)
+    struct.pack_into("<H", plain, order.index('A') * 12, 33)   # some move id
+    plain[order.index('E') * 12] = 4                           # some EVs
+    struct.pack_into("<H", m, 28,
+                     sum(struct.unpack("<24H", plain)) & 0xFFFF)
+    key = pers ^ otid
+    m[32:80] = struct.pack("<12I",
+                           *(w ^ key for w in struct.unpack("<12I", plain)))
+    m[84] = level
+    return bytes(m)
+
+
+# (pers, otid, nickname, species_internal, level) per slot — pers values
+# chosen to exercise DIFFERENT substruct orders (pers%24 = 0, 12, 13, 7).
+SYN_PLAYER_MONS = [(24, 0x0001ABCD, "SYNTHA", 286, 50),
+                   (36, 0x00020042, "SYNTHB", 359, 55)]
+SYN_OPP_MONS = [(61, 0x0003BEEF, "OPPA", 130, 60),
+                (7, 0x0004CAFE, "OPPB", 65, 61)]
+SYN_SEED = 0x12345678
+SYN_LANE0_LEN = 40
+
+
+def build_synthetic_record() -> bytes:
+    """A fully valid .rec built from scratch: Battle Dome, Open Level,
+    singles vs frontier trainer #83, recorded by GUY (ENG)."""
+    buf = bytearray(rec.SECTOR_SIZE)
+    struct.pack_into("<I", buf, 0, rec.SENTINEL)
+    r = memoryview(buf)[rec.STRUCT_OFF:rec.STRUCT_OFF + 3968]
+    for i, mon in enumerate(SYN_PLAYER_MONS):
+        r[i * 100:(i + 1) * 100] = build_synthetic_mon(*mon)
+    for i, mon in enumerate(SYN_OPP_MONS):
+        r[600 + i * 100:600 + (i + 1) * 100] = build_synthetic_mon(*mon)
+    r[1200:1232] = b"\xFF" * 32                       # playersName[4][8]
+    name = g3_encode("GUY")
+    r[1200:1200 + len(name)] = name                   # slot 0 = recorder
+    # playersGender/playersTrainerId stay zero (male, TID 0 is fine)
+    r[1252] = 2                                       # slot-0 language ENG
+    struct.pack_into("<I", r, 1256, SYN_SEED)         # rngSeed
+    # battleFlags: BATTLE_TYPE_TRAINER (bit3) — nonzero, no forbidden bits
+    struct.pack_into("<I", r, 1260, 0x00000008)
+    struct.pack_into("<H", r, 1268, 83)               # opponentA: frontier
+    r[1276] = 1                                       # lvlMode: Open Level
+    r[1277] = 1                                       # facility: Battle Dome
+    r[1279] = 0                                       # anims ON, text slow
+    r[1284:1292] = b"\xFF" * 8                        # recordMixFriendName
+    r[1308:3964] = b"\xFF" * (3964 - 1308)            # battleRecord lanes
+    for i in range(SYN_LANE0_LEN):                    # lane 0: 40 input bytes
+        r[1308 + i] = 0x12
+    struct.pack_into("<I", r, rec.CHECKSUM_RANGE,
+                     sum(bytes(r[:rec.CHECKSUM_RANGE])) & 0xFFFFFFFF)
+    return bytes(buf)
+
+
+def build_synthetic_save() -> bytes:
+    """A 128 KiB non-uniform stand-in save image for the inject test (the
+    inject checks are content-agnostic byte comparisons, but a patterned
+    image makes the 'rest untouched' assertions meaningful)."""
+    return bytes(range(256)) * (rec.SAV_MIN_SIZE // 256)
+
+
+def test_synthetic_record(data: bytes):
+    print("-- synthetic record sanity (validate + parse round-trip)")
+    ok(len(data) == rec.SECTOR_SIZE, "synthetic record has the wrong size")
+    ok(rec.validate(data) == [],
+       f"synthetic record must be fully valid, got {rec.validate(data)}")
+    info = rec.parse(data)
+    ok(info["valid"] and info["errors"] == [], "parse() disagrees")
+    ok(info["facility"] == "Battle Dome" and info["facility_id"] == 1,
+       f"facility wrong: {info['facility']!r}")
+    ok(info["level_mode"] == "Open Level", "level mode wrong")
+    ok(info["rng_seed"] == "%08x" % SYN_SEED,
+       f"seed wrong: {info['rng_seed']}")
+    ok(info["recorded_by"] == "GUY" and info["players"] == ["GUY"],
+       f"recorder name wrong: {info['recorded_by']!r} / {info['players']}")
+    ok(info["players_language"] == ["ENG"],
+       f"language wrong: {info['players_language']}")
+    ok(info["input_lanes"] == [SYN_LANE0_LEN, 0, 0, 0],
+       f"input lanes wrong: {info['input_lanes']}")
+    ok(info["opponent_a"] == 83 and info["opponent_a_kind"] == "frontier",
+       f"opponent wrong: {info['opponent_a']} {info['opponent_a_kind']}")
+    ok(info["battle_scene_off"] is False and info["text_speed"] == "slow",
+       "options byte wrong")
+    for side, spec in (("player", SYN_PLAYER_MONS),
+                       ("opponent", SYN_OPP_MONS)):
+        team = info["teams"][side]
+        ok(len(team) == len(spec), f"{side} team size wrong: {len(team)}")
+        ok(all(m["checksum_ok"] for m in team),
+           f"{side} team has a bad mon checksum — encryption reverse broken")
+        ok([m["nickname"] for m in team] == [s[2] for s in spec],
+           f"{side} nicknames wrong: {[m['nickname'] for m in team]}")
+        ok([m["species_internal"] for m in team] == [s[3] for s in spec],
+           f"{side} species wrong (substruct-order reverse broken): "
+           f"{[m['species_internal'] for m in team]}")
+        ok([m["level"] for m in team] == [s[4] for s in spec],
+           f"{side} levels wrong")
+        ok(not any(m["shiny"] for m in team),
+           f"{side} team unexpectedly shiny")
+    summary = rec.summarize(info)
+    ok("Battle Dome" in summary and "GUY" in summary,
+       "summarize() missing facility or recorder")
+    print("   sentinel/flags/checksum valid; both encrypted teams decode "
+          "byte-exact")
 
 
 def test_real_recs(paths):
@@ -126,11 +277,10 @@ def test_corruption(data: bytes):
     print(f"   all corruption variants rejected with reasons")
 
 
-def test_inject(data: bytes):
+def test_inject(data: bytes, sav: bytes):
     print("-- inject() round-trip")
-    sav = open(TEMPLATE_SAV, "rb").read()
     ok(len(sav) >= rec.SAV_MIN_SIZE,
-       f"template.sav unexpectedly small ({len(sav)} B)")
+       f"save image unexpectedly small ({len(sav)} B)")
 
     src = bytearray(sav)                       # prove caller buffer untouched
     out = rec.inject(data, src)
@@ -213,23 +363,44 @@ def test_patch_options(data: bytes):
 
 
 def main():
-    # A skipped required-asset section must NOT report success: exit 2 so
-    # an exit-code-reading orchestrator/CI never mistakes "nothing ran"
-    # (local/ is gitignored, so a fresh clone has no assets) for a pass.
+    # Exit semantics (CI reads these):
+    #   0 — every section ran and passed, on real assets OR (fresh clone /
+    #       CI, where gitignored local/ is absent) on the full synthetic
+    #       suite ('SYNTHETIC MODE').
+    #   2 — required assets missing with NO synthetic substitute possible
+    #       (real records present but template.sav absent -> inject can't
+    #       run), a vacuous run (zero checks), or any skip/substitution
+    #       under REC2MP4_REQUIRE_ASSETS=1 (strict local mode).
     skipped = []
+    synthetic = False
     paths = sorted(glob.glob(os.path.join(RECS_DIR, "*.rec")))
-    if not os.path.isdir(RECS_DIR) or not paths:
-        skipped.append(f"no .rec files in {RECS_DIR} — "
-                       "real-record, corruption and inject tests need one")
-    else:
+    if paths:
         test_real_recs(paths)
         reference = open(paths[0], "rb").read()
-        test_corruption(reference)
-        test_patch_options(reference)
         if os.path.isfile(TEMPLATE_SAV):
-            test_inject(reference)
+            sav = open(TEMPLATE_SAV, "rb").read()
         else:
+            sav = None
             skipped.append(f"{TEMPLATE_SAV} absent — inject test skipped")
+    else:
+        synthetic = True
+        print("SYNTHETIC MODE: no .rec files in "
+              f"{RECS_DIR} (gitignored local assets absent) — running the "
+              "FULL suite on a from-scratch synthetic record + save")
+        reference = build_synthetic_record()
+        test_synthetic_record(reference)
+        sav = build_synthetic_save()
+    test_corruption(reference)
+    test_patch_options(reference)
+    if sav is not None:
+        test_inject(reference, sav)
+    if os.environ.get("REC2MP4_REQUIRE_ASSETS") and (synthetic or skipped):
+        print("SKIPPED, not passed (REC2MP4_REQUIRE_ASSETS=1): "
+              f"{_checks} check(s) ran but real assets were "
+              + ("substituted with synthetic ones"
+                 if synthetic else "partially missing")
+              + " — supply local/recs/*.rec and local/template.sav")
+        sys.exit(2)
     if skipped or _checks == 0:
         for s in skipped:
             print(f"SKIP: {s}")
@@ -237,7 +408,8 @@ def main():
               "assets were missing — supply local/recs/*.rec and "
               "local/template.sav for a real run")
         sys.exit(2)
-    print(f"PASS: {_checks} checks")
+    print(f"PASS: {_checks} checks"
+          + (" (SYNTHETIC MODE — no real assets)" if synthetic else ""))
 
 
 if __name__ == "__main__":

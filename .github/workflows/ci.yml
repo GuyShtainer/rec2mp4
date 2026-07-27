@@ -1,0 +1,95 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Guy Shtainer
+#
+# rec2mp4 CI — everything here runs WITHOUT any game data.
+#
+# The full emulator replay (boot ROM -> menu-drive -> play back the record ->
+# encode) is user-asset-gated by design: it needs a US Emerald ROM, a
+# post-game save and real .rec files, none of which are (or ever will be)
+# committed — local/ is gitignored. That end-to-end path therefore stays OUT
+# of CI and is validated manually (see README "Status"). What CI covers:
+#
+#   tests    — the parser/validator/injector suite (tests/test_rec.py) on all
+#              three OSes. With no local/ assets the suite runs its FULL set
+#              of sections on a synthetic record + save ("SYNTHETIC MODE",
+#              exit 0); exit 2 would mean a vacuous run and fails the job.
+#              Plus the naming/sidecar suite (tests/test_naming.py), whose
+#              asset-free sections always run; its ROM ground-truth section
+#              skips cleanly with exit 0 when local/rom.gba is absent.
+#   encoder  — the real ffmpeg encode path: rec2mp4/video.py's self-test
+#              pipes synthetic frames + PCM through ffmpeg and verifies the
+#              result with ffprobe (codecs, geometry, duration, temp cleanup).
+#   bindings — Windows + macOS: tools/fetch_bindings.py downloads the
+#              prebuilt hanzi/libmgba-py 0.2.0-2 zip into vendor/ and ends
+#              with an `import mgba.core` smoke test, so the Windows
+#              emulator-import path is exercised on every push.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    name: tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: parser / validator / injector suite (synthetic mode in CI)
+        run: python tests/test_rec.py
+      - name: naming / romdata / sidecar suite (asset-free sections)
+        run: python tests/test_naming.py
+
+  encoder:
+    name: encoder self-test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+      - name: install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - name: install ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+      - name: video.py self-test (real encode, verified with ffprobe)
+        run: python -m rec2mp4.video
+
+  bindings:
+    name: mGBA bindings fetch + import (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # The macOS bindings dynamically link brew's libmgba.0.10.dylib; the
+      # win64 zip is self-contained (mgba.dll + dependency DLLs bundled).
+      - name: install libmgba (macOS only)
+        if: runner.os == 'macOS'
+        run: brew install mgba
+      - name: fetch prebuilt bindings into vendor/ + import smoke test
+        run: python tools/fetch_bindings.py
