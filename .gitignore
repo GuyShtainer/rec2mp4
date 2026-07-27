@@ -25,5 +25,9 @@ dist/
 # Internal dev docs (session notes stay local)
 docs/HANDOFF.md
 
+# Research frame captures = in-game screenshots (Nintendo-rendered pixels) —
+# referenced by docs/research/opponent-pov.md but never committed
+docs/research/opponent-pov/
+
 # macOS
 .DS_Store
