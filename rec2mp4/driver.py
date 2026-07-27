@@ -357,6 +357,9 @@ class EmulatorDriver:
     def _u16(self, addr: int) -> int:
         return int.from_bytes(self._read(addr, 2), "little")
 
+    def _s16(self, addr: int) -> int:
+        return int.from_bytes(self._read(addr, 2), "little", signed=True)
+
     def _u32(self, addr: int) -> int:
         return int.from_bytes(self._read(addr, 4), "little")
 
@@ -553,21 +556,94 @@ class EmulatorDriver:
         return pass_data
 
     def _step_cursor_to_record(self, pass_data: int):
-        # Free-moving hand cursor spawns at (176,104). Two phases (a pure
-        # diagonal exits RECORD's y-band before entering its x-band):
-        # hold LEFT until cursorArea == POINTS(5), then UP until RECORD(3).
+        # CLOSED-LOOP steering of the free-moving Frontier-Pass hand onto
+        # BATTLE RECORD. The old fixed route (hold LEFT to POINTS, then UP to
+        # RECORD) assumed the hand spawns at (176,104) — true only when the
+        # trainer is NOT standing in the frontier. AllocateFrontierPassData
+        # (pokeemerald src/frontier_pass.c:622-634) spawns the hand at
+        # (176,48) when the player is IN the Battle Frontier / Artisan Cave,
+        # from which "LEFT to POINTS" (a y~108 band) never triggers -> stall.
+        #
+        # Instead, each frame we read the LIVE cursor pixel coords and press
+        # the D-pad toward RECORD's hitbox, stopping the instant cursorArea
+        # becomes RECORD. Facts from the decomp (reference only):
+        #   * The hand moves the CURSOR SPRITE 2 px/frame while a D-pad dir is
+        #     held (Task_HandleFrontierPassInput, :991-1019); UP decreases y.
+        #     sPassData->cursorX/Y do NOT track this (synced only on A-press,
+        #     :982-983) -> we read sPassGfx->cursorSprite->x/y (the live pos).
+        #   * cursorArea is recomputed every moved frame from
+        #     GetCursorAreaFromCoords(spriteX-5, spriteY+5) (:1052) against
+        #     sPassAreasLayout[RECORD] = {y 80..102, x 20..108} (:350).
+        #   * A is honoured only on a frame where the hand did NOT move
+        #     (`if (!var)`, :1021) -> release + coast 2 frames before A.
         area_addr = pass_data + S.PASS_CURSOR_AREA_OFFSET
-        self._wait(lambda: self._u8(area_addr) == S.CURSOR_AREA_POINTS,
-                   "pass-cursor", S.PASS_CURSOR_PHASE_TIMEOUT_FRAMES,
-                   keys=S.KEYMASK_LEFT)
-        self._wait(lambda: self._u8(area_addr) == S.CURSOR_AREA_RECORD,
-                   "pass-cursor", S.PASS_CURSOR_PHASE_TIMEOUT_FRAMES,
-                   keys=S.KEYMASK_UP)
+        gfx = self._u32(S.SPASS_GFX_PTR)
+        if not (0x02000000 <= gfx < 0x02040000):
+            raise _StepStall("pass-cursor", f"sPassGfx invalid: 0x{gfx:08X}")
+        sprite = self._u32(gfx + S.PASS_GFX_CURSOR_SPRITE_OFFSET)
+        if not (0x02000000 <= sprite < 0x02040000):
+            raise _StepStall("pass-cursor",
+                             f"cursorSprite invalid: 0x{sprite:08X}")
+        x_addr = sprite + S.SPRITE_X_OFFSET
+        y_addr = sprite + S.SPRITE_Y_OFFSET
+
+        # Empirical offset check: at pass-open the sprite (and sPassData) read
+        # (176,104) off the frontier / (176,48) in it.
+        self._log(f"[f{self._frames_run}] pass cursor start: "
+                  f"sprite=({self._s16(x_addr)},{self._s16(y_addr)}) "
+                  f"sPassData=({self._s16(pass_data + S.PASS_CURSOR_X_OFFSET)},"
+                  f"{self._s16(pass_data + S.PASS_CURSOR_Y_OFFSET)}) "
+                  f"area={self._u8(area_addr)}")
+
+        aim_x = S.PASS_RECORD_SPRITE_X_AIM
+        aim_y = S.PASS_RECORD_SPRITE_Y_AIM
+        dead = S.PASS_CURSOR_DEADZONE
+        stuck = 0
+        for _ in range(S.PASS_CURSOR_STEER_TIMEOUT_FRAMES):
+            if self._u8(area_addr) == S.CURSOR_AREA_RECORD:
+                break
+            x, y = self._s16(x_addr), self._s16(y_addr)
+            keys = 0
+            if x > aim_x + dead:
+                keys |= S.KEYMASK_LEFT
+            elif x < aim_x - dead:
+                keys |= S.KEYMASK_RIGHT
+            if y > aim_y + dead:
+                keys |= S.KEYMASK_UP      # UP decreases sprite y (:993)
+            elif y < aim_y - dead:
+                keys |= S.KEYMASK_DOWN
+            if keys == 0:
+                # Inside both deadzones yet not on RECORD (should not happen
+                # given the hitbox) — nudge LEFT to force a coord re-eval.
+                keys = S.KEYMASK_LEFT
+            self._advance(keys)
+            nx, ny = self._s16(x_addr), self._s16(y_addr)
+            if (nx, ny) == (x, y):
+                # Pressed but nothing moved: a clamped screen edge. Our aim is
+                # interior so this is unexpected; bail after a few frames
+                # rather than burn the whole cap.
+                stuck += 1
+                if stuck > 8:
+                    raise _StepStall(
+                        "pass-cursor",
+                        f"cursor blocked at sprite=({x},{y}), "
+                        f"area={self._u8(area_addr)}")
+            else:
+                stuck = 0
+        else:
+            raise _StepStall(
+                "pass-cursor",
+                f"cursor never reached RECORD in "
+                f"{S.PASS_CURSOR_STEER_TIMEOUT_FRAMES} frames "
+                f"(sprite=({self._s16(x_addr)},{self._s16(y_addr)}), "
+                f"cursorArea={self._u8(area_addr)})")
+
         # A is only processed on a frame where the cursor did NOT move:
         # release the D-pad and coast 2 frames before pressing A.
         self._advance(0)
         self._advance(0)
-        self._log(f"[f{self._frames_run}] cursor on BATTLE RECORD")
+        self._log(f"[f{self._frames_run}] cursor on BATTLE RECORD "
+                  f"(sprite=({self._s16(x_addr)},{self._s16(y_addr)}))")
 
     def _step_select_record(self):
         # No confirmation dialog: A -> CB2_ShowFrontierPassFeature -> fade ->

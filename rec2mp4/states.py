@@ -127,11 +127,45 @@ MENU_ACTION_PLAYER = 4                # start-menu action id of the player-name 
 
 SPASS_DATA_PTR = 0x02039CEC           # sPassData (src/frontier_pass.c) — ptr to FrontierPassData
 PASS_STATE_OFFSET = 4                 # FrontierPassData.state (u16)
-PASS_CURSOR_AREA_OFFSET = 12          # FrontierPassData.cursorArea (u8)
+# FrontierPassData layout (frontier_pass.c:107-120): callback u32 @0,
+# state u16 @4, battlePoints u16 @6, cursorX s16 @8, cursorY s16 @10,
+# cursorArea u8 @12, previousCursorArea u8 @13, bitfield byte @14.
+PASS_CURSOR_X_OFFSET = 8              # FrontierPassData.cursorX (s16) — see caveat below
+PASS_CURSOR_Y_OFFSET = 10            # FrontierPassData.cursorY (s16)
+PASS_CURSOR_AREA_OFFSET = 12          # FrontierPassData.cursorArea (u8) — updated LIVE
 PASS_FLAGS_OFFSET = 14                # FrontierPassData byte holding hasBattleRecord bit0
 PASS_HAS_BATTLE_RECORD_MASK = 0x01    # CanCopyRecordedBattleSaveData() result, cached at open
 CURSOR_AREA_RECORD = 3                # CURSOR_AREA_RECORD (enum, src/frontier_pass.c)
 CURSOR_AREA_POINTS = 5                # CURSOR_AREA_POINTS — box directly below RECORD
+
+# --- Live Frontier-Pass hand-cursor position (for closed-loop steering) ---
+# CAVEAT: sPassData->cursorX/cursorY (offsets 8/10 above) hold ONLY the
+# initial value and the A-press snapshot — they are NOT updated while the
+# hand moves. Task_HandleFrontierPassInput (frontier_pass.c:991-1019) moves
+# the CURSOR SPRITE by 2 px/frame (sPassGfx->cursorSprite->x/y) and syncs it
+# back into sPassData only inside TryCallPassAreaFunction (:982-983, on A).
+# So live steering must read the sprite coords via sPassGfx.
+SPASS_GFX_PTR = 0x02039CF0            # sPassGfx (frontier_pass.c) -> FrontierPassGfx
+PASS_GFX_CURSOR_SPRITE_OFFSET = 0     # FrontierPassGfx.cursorSprite (first member)
+SPRITE_X_OFFSET = 0x20                # struct Sprite.x (s16, include/sprite.h:204)
+SPRITE_Y_OFFSET = 0x22                # struct Sprite.y (s16)
+
+# RECORD hitbox in SPRITE coords. GetCursorAreaFromCoords (:869) tests
+# (spriteX-5, spriteY+5) against sPassAreasLayout[RECORD-1] =
+# {yStart 80, yEnd 102, xStart 20, xEnd 108} (:350). The sprite is therefore
+# over RECORD when spriteX-5 in [20,108] and spriteY+5 in [80,102]:
+PASS_RECORD_SPRITE_X_LO = 25          # 20 + 5
+PASS_RECORD_SPRITE_X_HI = 113         # 108 + 5
+PASS_RECORD_SPRITE_Y_LO = 75          # 80 - 5
+PASS_RECORD_SPRITE_Y_HI = 97          # 102 - 5
+# Aim for the band centre. Even targets stay reachable from the even start
+# coords (176,104)/(176,48) in 2 px steps; the loop stops the instant
+# cursorArea == RECORD, so exact centring is never actually required.
+PASS_RECORD_SPRITE_X_AIM = 68
+PASS_RECORD_SPRITE_Y_AIM = 86
+PASS_CURSOR_DEADZONE = 3              # px; |coord - aim| <= this -> stop that axis
+PASS_CURSOR_STEP = 2                  # px/frame the sprite moves while held (:993)
+PASS_CURSOR_STEER_TIMEOUT_FRAMES = 600  # generous cap for the full route
 
 GBATTLE_TYPE_FLAGS = 0x02022FEC       # gBattleTypeFlags (u32)
 BATTLE_TYPE_RECORDED_MASK = 1 << 24   # BATTLE_TYPE_RECORDED — set during playback (sanity)
