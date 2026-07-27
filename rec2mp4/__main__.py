@@ -62,6 +62,18 @@ def _build_parser() -> argparse.ArgumentParser:
                         "(default 4 = 960x640)")
     p.add_argument("--no-audio", action="store_true",
                    help="encode video only, no audio track")
+    p.add_argument("--anims", choices=("on", "off", "record"), default="on",
+                   help="battle animations in the replay: 'on' (default) "
+                        "forces move effects and the shiny sparkle visible "
+                        "even if the recorder played with BATTLE SCENE OFF; "
+                        "'off' hides them; 'record' keeps the recorder's own "
+                        "setting. Presentation-only — cannot desync the "
+                        "replay (animations use the game's separate visual "
+                        "RNG stream)")
+    p.add_argument("--text-speed", choices=("slow", "mid", "fast", "record"),
+                   default="record",
+                   help="dialogue text speed during the replay "
+                        "(default: as recorded)")
     p.add_argument("--info-only", action="store_true",
                    help="validate + summarize the record(s), then exit "
                         "without emulating")
@@ -204,6 +216,30 @@ def main(argv: list[str] | None = None) -> int:
         out_path = outdir / (rp.stem + ".mp4")
         writer = None
         try:
+            # Presentation overrides are patched into the record itself
+            # (the game reads BATTLE SCENE / text speed from the record).
+            if args.anims != "record" or args.text_speed != "record":
+                want_anims = None if args.anims == "record" \
+                    else args.anims == "on"
+                want_speed = None if args.text_speed == "record" \
+                    else {"slow": 0, "mid": 1, "fast": 2}[args.text_speed]
+                patched = rec.patch_options(data, animations=want_anims,
+                                            text_speed=want_speed)
+                if patched != data:
+                    changes = []
+                    if want_anims is not None and \
+                            (want_anims == info["battle_scene_off"]):
+                        changes.append(
+                            f"animations {'ON' if want_anims else 'OFF'} "
+                            f"(recorded "
+                            f"{'OFF' if info['battle_scene_off'] else 'on'})")
+                    if want_speed is not None and \
+                            args.text_speed != info["text_speed"]:
+                        changes.append(f"text {args.text_speed} "
+                                       f"(recorded {info['text_speed']})")
+                    if changes:
+                        print("  override: " + ", ".join(changes))
+                    data = patched
             injected = rec.inject(data, sav_bytes)
             with driver_mod.EmulatorDriver(str(rom_path), injected,
                                            headed=args.headed,

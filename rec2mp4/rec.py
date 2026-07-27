@@ -309,6 +309,45 @@ def inject(rec: bytes, sav: bytes) -> bytes:
     return bytes(out)
 
 
+def patch_options(rec: bytes, animations: bool | None = None,
+                  text_speed: int | None = None) -> bytes:
+    """Return a copy of the record with its presentation options overridden.
+
+    Struct byte +1279 is a snapshot of the RECORDER's in-game options: bit0 =
+    battle animations OFF (a recorder who played with "BATTLE SCENE OFF" gets
+    replays without move effects or the shiny sparkle), bits1-3 = text speed
+    (0 slow / 1 mid / 2 fast). Playback reads these from the record itself
+    (recorded_battle.c keeps them in sBattleScene/sTextSpeed and hands them to
+    the battle via GetBattleSceneInRecordedBattle), so patching the byte
+    changes presentation only. It cannot desync the deterministic replay:
+    battle animations draw randomness exclusively from the separate Random2()
+    stream (no battle_anim_*.c source calls plain Random()), and recorded
+    inputs are consumed per decision, not per frame. The record checksum is
+    recomputed. animations=True means effects VISIBLE (bit0 cleared).
+    """
+    errors = validate(rec)
+    if errors:
+        raise RecError("refusing to patch an invalid record: "
+                       + "; ".join(errors))
+    out = bytearray(rec)
+    opt_off = STRUCT_OFF + 1279
+    opt = out[opt_off]
+    if animations is not None:
+        opt = (opt & ~0x01) | (0 if animations else 1)
+    if text_speed is not None:
+        if text_speed not in TEXT_SPEED:
+            raise RecError(f"text_speed must be one of {sorted(TEXT_SPEED)} "
+                           f"(got {text_speed})")
+        opt = (opt & ~0x0E) | ((text_speed & 7) << 1)
+    if opt == out[opt_off]:
+        return bytes(out)
+    out[opt_off] = opt
+    csum = sum(out[STRUCT_OFF:STRUCT_OFF + CHECKSUM_RANGE]) & 0xFFFFFFFF
+    out[STRUCT_OFF + CHECKSUM_RANGE:
+        STRUCT_OFF + CHECKSUM_RANGE + 4] = csum.to_bytes(4, "little")
+    return bytes(out)
+
+
 def summarize(info: dict) -> str:
     """Human-readable multi-line summary of a parse() result."""
     if not info.get("valid"):

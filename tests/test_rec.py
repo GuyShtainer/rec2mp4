@@ -166,6 +166,52 @@ def test_inject(data: bytes):
     print("   sector 31 byte-equal, rest untouched, RecError paths OK")
 
 
+def test_patch_options(data: bytes):
+    print("-- patch_options()")
+    opt_off = rec.STRUCT_OFF + 1279
+    base = rec.parse(data)
+
+    on = rec.patch_options(data, animations=True)
+    ok(rec.validate(on) == [], "animations=True result no longer validates")
+    ok(not (on[opt_off] & 1), "animations=True did not clear bit0")
+    off = rec.patch_options(data, animations=False)
+    ok(rec.validate(off) == [], "animations=False result no longer validates")
+    ok(off[opt_off] & 1, "animations=False did not set bit0")
+    ok(rec.parse(on)["battle_scene_off"] is False
+       and rec.parse(off)["battle_scene_off"] is True,
+       "parse() does not reflect the patched battle-scene bit")
+
+    for speed in (0, 1, 2):
+        p = rec.patch_options(data, text_speed=speed)
+        ok(rec.validate(p) == [], f"text_speed={speed} no longer validates")
+        ok((p[opt_off] >> 1) & 7 == speed, f"text_speed={speed} not applied")
+
+    # only the options byte and the checksum may differ
+    both = rec.patch_options(data, animations=True, text_speed=2)
+    ck = rec.STRUCT_OFF + rec.CHECKSUM_RANGE
+    diff = [i for i in range(rec.SECTOR_SIZE)
+            if both[i] != data[i] and not (i == opt_off or ck <= i < ck + 4)]
+    ok(not diff, f"patch_options touched unexpected offsets: {diff[:8]}")
+
+    # no-op patch (request the state the record already has) -> byte-identical
+    same = rec.patch_options(data, animations=not base["battle_scene_off"])
+    ok(same == data, "no-op patch is not byte-identical")
+
+    try:
+        rec.patch_options(data, text_speed=7)
+        ok(False, "patch_options accepted text_speed=7")
+    except rec.RecError:
+        pass
+    bad = bytearray(data)
+    bad[rec.STRUCT_OFF + 10] ^= 0xFF
+    try:
+        rec.patch_options(bytes(bad), animations=True)
+        ok(False, "patch_options accepted a corrupt record")
+    except rec.RecError:
+        pass
+    print("   bit0/text-speed patched, checksum refreshed, RecError paths OK")
+
+
 def main():
     # A skipped required-asset section must NOT report success: exit 2 so
     # an exit-code-reading orchestrator/CI never mistakes "nothing ran"
@@ -179,6 +225,7 @@ def main():
         test_real_recs(paths)
         reference = open(paths[0], "rb").read()
         test_corruption(reference)
+        test_patch_options(reference)
         if os.path.isfile(TEMPLATE_SAV):
             test_inject(reference)
         else:

@@ -121,13 +121,29 @@ python3 -m rec2mp4 my.rec --headed --sav local/alt-saves/all-shiny.sav
 
 # Video only, no audio track; 2x upscale instead of the default 4x (960x640)
 python3 -m rec2mp4 my.rec --no-audio --scale 2 --sav local/alt-saves/all-shiny.sav
+
+# Exactly as the recorder saw it (their BATTLE SCENE / text-speed settings)
+python3 -m rec2mp4 my.rec --anims record --text-speed record
 ```
 
 Options: `-o/--outdir` (default `out/`), `--rom` (default `local/rom.gba`),
 `--sav` (default `local/template.sav`), `--headed`, `--scale N`, `--no-audio`,
-`--info-only`, `--max-seconds N` (replay timeout, default 1800), `--pix-fmt`
-(raw-framebuffer format handed to ffmpeg, default `rgb0`). Exit code is
-non-zero if any record fails.
+`--anims on|off|record` (default `on`), `--text-speed slow|mid|fast|record`
+(default `record`), `--info-only`, `--max-seconds N` (replay timeout, default
+1800), `--pix-fmt` (raw-framebuffer format handed to ffmpeg, default `rgb0`).
+Exit code is non-zero if any record fails.
+
+**About `--anims`:** the record stores a snapshot of the *recorder's* in-game
+options (struct byte +1279); someone who battled with BATTLE SCENE OFF gets
+replays with no move effects and no shiny sparkle. rec2mp4 defaults to
+patching animations ON in the injected copy (checksum recomputed) so videos
+show everything. This is presentation-only and cannot desync the replay:
+Emerald's battle animations draw randomness exclusively from the separate
+`Random2()` stream — that separation exists precisely so link-battle peers
+with different scene settings stay in sync — and recorded inputs are consumed
+per decision, not per frame. Verified empirically: the same record converted
+with animations off (59.4 s) and on (73.6 s) reaches the same outcome with
+identical HP trajectories.
 
 ## Windows notes (untested)
 
