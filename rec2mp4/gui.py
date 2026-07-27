@@ -41,7 +41,7 @@ from .pipeline import (
     ConvertSettings, PipelineError, convert_one, load_context,
     pillow_available, pillow_hint, stack_status,
 )
-from .panel import PANEL_SECTIONS
+from .panel import PANEL_SECTIONS, STAT_PAGE_SECTIONS
 
 # tkinter is stdlib but *can* be absent (some minimal Linux pythons).
 # Import errors must not break `import rec2mp4.gui` for the pure-logic
@@ -212,6 +212,8 @@ def default_form() -> dict:
         "sidecar": True,
         "panel": "right",
         "panel_sections": list(PANEL_SECTIONS),
+        "panel_cycle": 0.0,
+        "panel_cycle_pages": list(STAT_PAGE_SECTIONS),
         "pov": "player",
     }
 
@@ -245,6 +247,22 @@ def settings_from_form(form: dict) -> ConvertSettings:
     if pov not in ("player", "opponent"):
         pov = "player"
 
+    # Stat-cycling: "cycle every N seconds" (0/blank = static panel) + which
+    # of moves/evs/ivs to rotate. Kept simple + validated so a bad number
+    # surfaces as a ValueError the GUI shows in a dialog (like scale).
+    raw_cycle = form.get("panel_cycle", 0.0)
+    try:
+        panel_cycle = float(raw_cycle or 0.0)
+    except (TypeError, ValueError):
+        raise ValueError(f"cycle seconds must be a number "
+                         f"(got {raw_cycle!r})") from None
+    if panel_cycle < 0:
+        raise ValueError(f"cycle seconds must be >= 0 (got {panel_cycle})")
+    cycle_pages = tuple(s for s in STAT_PAGE_SECTIONS
+                        if s in (form.get("panel_cycle_pages") or ()))
+    if not cycle_pages:
+        cycle_pages = STAT_PAGE_SECTIONS
+
     return ConvertSettings(
         rom=form.get("rom") or None,
         sav=form.get("sav") or None,
@@ -258,6 +276,8 @@ def settings_from_form(form: dict) -> ConvertSettings:
         panel=panel,
         panel_info=panel_info,
         pov=pov,
+        panel_cycle=panel_cycle,
+        panel_cycle_pages=cycle_pages,
     )
 
 
@@ -428,6 +448,9 @@ class GuiApp:
         self.var_pov = tk.StringVar(value=d["pov"])
         self.var_sections = {s: tk.BooleanVar(value=True)
                              for s in PANEL_SECTIONS}
+        self.var_cycle = tk.StringVar(value=str(d["panel_cycle"]))
+        self.var_cycle_pages = {s: tk.BooleanVar(value=True)
+                                for s in STAT_PAGE_SECTIONS}
 
         row1 = ttk.Frame(f)
         row1.pack(fill="x", pady=2)
@@ -459,6 +482,17 @@ class GuiApp:
         ttk.Label(row2, text="Sections:").pack(side="left")
         for s in PANEL_SECTIONS:
             ttk.Checkbutton(row2, text=s, variable=self.var_sections[s]
+                            ).pack(side="left", padx=(0, 4))
+
+        row_cycle = ttk.Frame(f)
+        row_cycle.pack(fill="x", pady=2)
+        ttk.Label(row_cycle, text="Cycle stats every").pack(side="left")
+        ttk.Spinbox(row_cycle, textvariable=self.var_cycle, from_=0, to=60,
+                    increment=1, width=4).pack(side="left", padx=(2, 2))
+        ttk.Label(row_cycle, text="s (0 = static) — pages:").pack(side="left")
+        for s in STAT_PAGE_SECTIONS:
+            ttk.Checkbutton(row_cycle, text=s,
+                            variable=self.var_cycle_pages[s]
                             ).pack(side="left", padx=(0, 4))
 
         row_pov = ttk.Frame(f)
@@ -584,6 +618,9 @@ class GuiApp:
             "panel": self.var_panel.get(),
             "panel_sections": [s for s in PANEL_SECTIONS
                                if self.var_sections[s].get()],
+            "panel_cycle": self.var_cycle.get(),
+            "panel_cycle_pages": [s for s in STAT_PAGE_SECTIONS
+                                  if self.var_cycle_pages[s].get()],
             "pov": self.var_pov.get(),
         }
 

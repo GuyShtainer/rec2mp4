@@ -77,9 +77,21 @@ def _build_parser() -> argparse.ArgumentParser:
                         "the plain game video")
     p.add_argument("--panel-info", default="all", metavar="CSV",
                    help="comma-separated panel sections: header, players, "
-                        "opponents, teams, export, footer — or 'all' "
-                        "(default). 'export' shows the first lines of a "
+                        "opponents, teams, moves, evs, ivs, export, footer — "
+                        "or 'all' (default). 'moves' lists each mon's moves "
+                        "(names read from YOUR ROM); 'evs'/'ivs' show the six "
+                        "values plus a bold Sum (EV /510, IV /186, a star on "
+                        "perfect IVs); 'export' shows the first lines of a "
                         "PokeDNA '<stem>.txt' info sidecar when present")
+    p.add_argument("--panel-cycle", type=float, default=0.0, metavar="SECONDS",
+                   help="cycle the stat views (moves/evs/ivs) over time: show "
+                        "each page for SECONDS, looping for the whole video "
+                        "(so a non-interactive viewer sees every page). "
+                        "0 (default) keeps a single static panel. Needs Pillow")
+    p.add_argument("--panel-cycle-pages", default="moves,evs,ivs",
+                   metavar="CSV",
+                   help="which stat pages --panel-cycle rotates through: any "
+                        "of moves, evs, ivs (default all three)")
     p.add_argument("--pov", choices=("player", "opponent"), default="player",
                    help="whose side the camera is on. 'player' (default) is "
                         "the normal replay; 'opponent' flips the camera to "
@@ -163,7 +175,11 @@ def main(argv: list[str] | None = None) -> int:
             plain_names=args.plain_names, sidecar=not args.no_sidecar,
             pix_fmt=args.pix_fmt, max_seconds=args.max_seconds,
             headed=args.headed, panel=args.panel,
-            panel_info=args.panel_info, pov=args.pov)
+            panel_info=args.panel_info, pov=args.pov,
+            panel_cycle=args.panel_cycle,
+            panel_cycle_pages=tuple(
+                x.strip() for x in args.panel_cycle_pages.split(",")
+                if x.strip()))
         try:
             ctx = load_context(settings)
         except PipelineError as exc:

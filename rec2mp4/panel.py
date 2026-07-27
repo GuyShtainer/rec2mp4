@@ -22,11 +22,18 @@ from __future__ import annotations
 
 import io
 
-from . import romdata
+from . import rec, romdata
+from .rec import STAT_KEYS, STAT_LABELS
 
 # Sections the panel can draw, in draw order. --panel-info picks a subset.
-PANEL_SECTIONS = ("header", "players", "opponents", "teams", "export",
-                  "footer")
+# The three per-mon stat blocks (moves / evs / ivs) sit right after "teams";
+# they are also the pages the optional time-cycling panel flips through.
+PANEL_SECTIONS = ("header", "players", "opponents", "teams",
+                  "moves", "evs", "ivs", "export", "footer")
+
+# The subset of PANEL_SECTIONS that show decoded per-mon battle stats. These
+# are what --panel-cycle rotates through over time (one page each).
+STAT_PAGE_SECTIONS = ("moves", "evs", "ivs")
 
 # Colors (RGB) — dark, readable at 640 px height.
 _BG = (16, 20, 26)
@@ -64,6 +71,31 @@ def parse_panel_info(csv: str | None) -> tuple[str, ...]:
         return PANEL_SECTIONS
     # keep PANEL_SECTIONS draw order, drop duplicates
     return tuple(s for s in PANEL_SECTIONS if s in tokens)
+
+
+def parse_cycle_pages(csv) -> tuple[str, ...]:
+    """--panel-cycle-pages CSV -> ordered tuple of stat page names.
+
+    'all', '' and None select all three stat pages (moves, evs, ivs). Unknown
+    names raise ValueError (surfaced as a CLI/pipeline error before emulation).
+    """
+    if csv is None:
+        return STAT_PAGE_SECTIONS
+    if isinstance(csv, (tuple, list)):
+        tokens = [str(t).strip().lower() for t in csv if str(t).strip()]
+    else:
+        text = str(csv).strip().lower()
+        if text in ("", "all"):
+            return STAT_PAGE_SECTIONS
+        tokens = [t.strip() for t in text.split(",") if t.strip()]
+    if not tokens:
+        return STAT_PAGE_SECTIONS
+    unknown = [t for t in tokens if t not in STAT_PAGE_SECTIONS]
+    if unknown:
+        raise ValueError(
+            "unknown --panel-cycle-pages page(s): %s (valid: %s, or 'all')"
+            % (", ".join(unknown), ", ".join(STAT_PAGE_SECTIONS)))
+    return tuple(s for s in STAT_PAGE_SECTIONS if s in tokens)
 
 
 def _require_pil():
@@ -108,6 +140,90 @@ def _mon_display_name(mon: dict, rom_bytes) -> tuple[str, str | None]:
     if nick and nick.upper() != species.upper():
         return species, nick
     return species, None
+
+
+def _ev_value_str(ev: dict) -> str:
+    """'HP 0  Atk 252  Def 0  SpA 0  SpD 4  Spe 252' from an EV dict."""
+    return "  ".join("%s %d" % (STAT_LABELS[k], ev[k]) for k in STAT_KEYS)
+
+
+def _iv_value_str(iv: dict) -> str:
+    """Same layout as EVs, but a perfect (31) IV is flagged with a '*'."""
+    return "  ".join("%s %d%s" % (STAT_LABELS[k], iv[k],
+                                  "*" if iv[k] == 31 else "")
+                     for k in STAT_KEYS)
+
+
+def _move_labels(mon: dict, rom_bytes) -> list[str]:
+    """Move names for one mon, read from the ROM; 'Move #id' when unknown."""
+    labels = []
+    for mv in mon.get("moves", []):
+        name = romdata.move_name(rom_bytes, mv["id"]) if rom_bytes else None
+        labels.append(name or ("Move #%d" % mv["id"]))
+    return labels
+
+
+def stat_page_lines(info: dict, extras: dict, kind: str) -> list[tuple]:
+    """Styled text lines for one stat block (both teams), as (text, role).
+
+    Pure logic — no Pillow. render_panel draws these with role-specific
+    fonts/colors; tests use stat_manifest() (the plain-text projection) to
+    assert content like the 'Sum NNN/510' / 'Sum NNN/186' totals and the
+    ROM-resolved move names. Roles:
+        title       -> dim section header ("<PLAYER> MOVES")
+        name        -> a mon name line (moves page)
+        moves       -> that mon's comma-joined move names
+        namesum     -> "<name>  Sum NNN/510|186[ PERFECT]" (sum drawn bold)
+        values      -> the six EV/IV values
+        unavailable -> "<name>  (stats unavailable)" (checksum not ok)
+    kind is one of STAT_PAGE_SECTIONS.
+    """
+    rom_bytes = extras.get("rom_bytes")
+    titles = {"player": (info.get("recorded_by") or "Player").strip()
+              or "Player", "opponent": "Opponent"}
+    suffix = {"moves": "MOVES", "evs": "EVs", "ivs": "IVs"}[kind]
+    out: list[tuple] = []
+    for side in ("player", "opponent"):
+        mons = (info.get("teams") or {}).get(side) or []
+        if not mons:
+            continue
+        out.append((titles[side].upper() + " " + suffix, "title"))
+        for m in mons:
+            species, nick = _mon_display_name(m, rom_bytes)
+            # Prefer the ROM species name; when the species is an unknown
+            # "#id" placeholder, fall back to the mon's nickname so the row
+            # still names something recognisable.
+            if species.startswith("#") and nick:
+                species = nick
+            # The moves/evs/ivs keys are present ONLY when the mon's checksum
+            # verified (see rec._decode_mon) — their absence means "untrusted".
+            if kind not in m:
+                out.append(("%s  (stats unavailable)" % species,
+                            "unavailable"))
+                continue
+            if kind == "moves":
+                names = _move_labels(m, rom_bytes)
+                out.append(("%s:" % species, "name"))
+                out.append(("  " + (", ".join(names) or "(no moves)"),
+                            "moves"))
+            elif kind == "evs":
+                ev = m["evs"]
+                out.append(("%s  Sum %d/510" % (species, ev["sum"]),
+                            "namesum"))
+                out.append(("  " + _ev_value_str(ev), "values"))
+            else:                               # ivs
+                iv = m["ivs"]
+                perfect = " PERFECT" if iv["sum"] == 186 else ""
+                out.append(("%s  Sum %d/186%s" % (species, iv["sum"], perfect),
+                            "namesum"))
+                out.append(("  " + _iv_value_str(iv), "values"))
+    return out
+
+
+def stat_manifest(info: dict, extras: dict, kind: str) -> list[str]:
+    """Plain-text projection of stat_page_lines() — the exact strings the
+    stat block draws, for tests / a debug manifest (no Pillow needed)."""
+    return [text for text, _ in stat_page_lines(info, extras, kind)]
 
 
 def render_panel(info: dict, extras: dict, size: tuple[int, int]) -> bytes:
@@ -259,6 +375,68 @@ def render_panel(info: dict, extras: dict, size: tuple[int, int]) -> bytes:
             y += px_small // 2
         rule()
 
+    # ----------------------------------------------- stats (moves/evs/ivs)
+    def draw_stat_section(kind: str):
+        """Draw one per-mon stat block, shrinking the font so both teams'
+        actual mons fit before falling back to line()'s truncation."""
+        nonlocal y
+        rows = stat_page_lines(info, extras, kind)
+        if not rows:
+            return
+        # Adaptive font: budget the remaining height across all rows so a
+        # full 6v6 still fits; never smaller than px_small*0.62 (still legible)
+        # and never larger than px_small (the panel's body-detail size).
+        avail = max(0, y_limit - y)
+        base_step = int(px_small * 1.45)
+        needed = len(rows) * base_step
+        spx = px_small
+        if needed > avail and avail > 0:
+            spx = max(int(px_small * 0.62),
+                      int(px_small * avail / needed))
+        sfont = _font(ImageFont, spx)
+        step = int(spx * 1.45)
+
+        for text, role in rows:
+            if y + step > y_limit:
+                break
+            if role == "namesum":
+                # "<name>  Sum NNN/510" — draw the name plain, the sum bold+gold
+                # (drawn first-protected: the name is ellipsized to leave room).
+                idx = text.find("  Sum ")
+                name_part = text[:idx] if idx >= 0 else text
+                sum_part = text[idx + 2:] if idx >= 0 else ""
+                sum_w = draw.textlength(sum_part, font=sfont) if sum_part else 0
+                gap = spx
+                name_budget = max_w - int(sum_w) - gap
+                shown = name_part
+                while shown and draw.textlength(
+                        shown + "...", font=sfont) > name_budget:
+                    shown = shown[:-1]
+                if shown != name_part and shown:
+                    shown += "..."
+                draw.text((margin, y), shown, font=sfont, fill=_FG)
+                if sum_part:
+                    sx = margin + max_w - int(sum_w)
+                    perfect = "PERFECT" in sum_part
+                    col = _GOLD if perfect else _GREEN
+                    draw.text((sx, y), sum_part, font=sfont, fill=col)
+                    draw.text((sx + 1, y), sum_part, font=sfont, fill=col)
+                y += step
+            else:
+                color = _DIM if role in ("title", "unavailable") else _FG
+                draw.text((margin, y), ellipsize(text, sfont),
+                          font=sfont, fill=color)
+                y += step
+        y += px_small // 2
+
+    stat_drawn = False
+    for _kind in STAT_PAGE_SECTIONS:
+        if _kind in sections:
+            draw_stat_section(_kind)
+            stat_drawn = True
+    if stat_drawn:
+        rule()
+
     # ----------------------------------------------------------- export
     if "export" in sections:
         shown = 0
@@ -293,3 +471,27 @@ def render_panel(info: dict, extras: dict, size: tuple[int, int]) -> bytes:
     buf = io.BytesIO()
     img.save(buf, "PNG")
     return buf.getvalue()
+
+
+def panel_pages(info: dict, extras: dict, size: tuple[int, int],
+                cycle_sections) -> list[bytes]:
+    """Render one PNG per requested stat page, sharing a static context.
+
+    Each page keeps the same non-stat sections (header / players / opponents /
+    teams / export / footer — whatever `extras['sections']` selected) and swaps
+    in exactly ONE stat block (moves | evs | ivs), so a caller can flip through
+    them over time. Returns a list of PNG byte strings in cycle order.
+
+    cycle_sections — an iterable/CSV of STAT_PAGE_SECTIONS; empty/None means
+    all three. Order follows STAT_PAGE_SECTIONS (moves, evs, ivs).
+    """
+    cycle = parse_cycle_pages(cycle_sections)
+    base = tuple(s for s in (extras.get("sections") or PANEL_SECTIONS)
+                 if s not in STAT_PAGE_SECTIONS)
+    pages: list[bytes] = []
+    for sec in cycle:
+        page_sections = tuple(s for s in PANEL_SECTIONS
+                              if s in base or s == sec)
+        page_extras = dict(extras, sections=page_sections)
+        pages.append(render_panel(info, page_extras, size))
+    return pages

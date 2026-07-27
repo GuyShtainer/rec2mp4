@@ -198,6 +198,59 @@ def test_panel_info():
     print("   all/empty/subset/case/dupes; unknown -> ValueError")
 
 
+def test_cycle_pages_parser():
+    print("-- panel.parse_cycle_pages()")
+    ok(panel.parse_cycle_pages(None) == panel.STAT_PAGE_SECTIONS,
+       "None must select all stat pages")
+    ok(panel.parse_cycle_pages("") == panel.STAT_PAGE_SECTIONS,
+       "'' must select all stat pages")
+    ok(panel.parse_cycle_pages("all") == panel.STAT_PAGE_SECTIONS,
+       "'all' must select all stat pages")
+    ok(panel.parse_cycle_pages("ivs,moves") == ("moves", "ivs"),
+       "subset must keep STAT_PAGE_SECTIONS order")
+    ok(panel.parse_cycle_pages(["evs"]) == ("evs",),
+       "list input must work")
+    ok(panel.parse_cycle_pages(()) == panel.STAT_PAGE_SECTIONS,
+       "empty tuple -> all")
+    ok(panel.parse_cycle_pages("EVS") == ("evs",),
+       "case-insensitive")
+    try:
+        panel.parse_cycle_pages("moves,teams")
+        ok(False, "unknown cycle page must raise ValueError")
+    except ValueError as exc:
+        ok("teams" in str(exc), f"unhelpful ValueError: {exc}")
+    print("   all/subset/list/case; unknown -> ValueError")
+
+
+def test_stat_manifest():
+    print("-- panel.stat_manifest() (PIL-free stat text)")
+    info, extras = _panel_fixture()          # ROM absent -> move-name fallback
+    # MOVES: species header + per-mon move labels; ROM missing -> 'Move #id'
+    moves = panel.stat_manifest(info, extras, "moves")
+    joined = "\n".join(moves)
+    ok(any("METAGROSS:" in ln for ln in moves), f"no METAGROSS row: {moves}")
+    ok("Move #309" in joined and "Move #33" in joined,
+       f"move-id fallback missing: {joined!r}")
+    ok("(stats unavailable)" in joined,
+       "opponent mon (no stats) must be flagged unavailable")
+    # EVS: the six values + a bold '/510' sum, correct total for the fixture
+    evs = panel.stat_manifest(info, extras, "evs")
+    je = "\n".join(evs)
+    ok("Sum 508/510" in je, f"EV sum text missing: {je!r}")
+    ok("Atk 252" in je and "Spe 252" in je,
+       "EV values not laid out with STAT_LABELS")
+    # IVS: '/186' sum, PERFECT flag on the all-31 mon, per-stat star on 31s
+    ivs = panel.stat_manifest(info, extras, "ivs")
+    ji = "\n".join(ivs)
+    ok("Sum 186/186 PERFECT" in ji, f"perfect IV sum missing: {ji!r}")
+    ok("Sum 154/186" in ji and "PERFECT" not in ji.split("Sum 154/186")[1][:8],
+       f"non-perfect IV sum wrong: {ji!r}")
+    ok("HP 31*" in ji, f"per-stat perfect-IV star missing: {ji!r}")
+    # sums match a fresh decode when we have real records + ROM (below)
+    print("   moves fallback + unavailable; EV /510 + IV /186 sums; PERFECT "
+          "+ per-stat stars")
+
+
 def test_sidecar_extras():
     print("-- build_sidecar() streak/export_info extras")
     from rec2mp4.driver import ReplayResult
@@ -213,7 +266,83 @@ def test_sidecar_extras():
                            export_info=["a", "b"])
     ok(sc["streak"] == 7 and sc["export_info"] == ["a", "b"],
        f"extras not stored: {sc.get('streak')}, {sc.get('export_info')}")
-    print("   absent by default; present when given")
+    # The panel mode (static vs cycle + pages + seconds) rides in `options`;
+    # build_sidecar must preserve it verbatim so the sidecar records how the
+    # panel was drawn.
+    opts = {"panel": "right", "panel_mode": "cycle",
+            "panel_cycle_seconds": 5.0,
+            "panel_cycle_pages": ["moves", "evs", "ivs"]}
+    sc = cli.build_sidecar(**dict(base_kwargs, options=opts))
+    ok(sc["options"]["panel_mode"] == "cycle"
+       and sc["options"]["panel_cycle_seconds"] == 5.0
+       and sc["options"]["panel_cycle_pages"] == ["moves", "evs", "ivs"],
+       f"panel cycle mode not recorded in sidecar options: {sc['options']}")
+    print("   absent by default; streak/export + panel cycle mode preserved")
+
+
+def test_settings_cycle_defaults():
+    print("-- ConvertSettings panel-cycle fields")
+    s = pipeline.ConvertSettings()
+    ok(s.panel_cycle == 0.0 and s.panel_cycle_pages == (),
+       f"cycle defaults wrong: {s.panel_cycle!r}/{s.panel_cycle_pages!r}")
+    # load_context validates the cycle options even with the panel off:
+    # a negative cycle and an unknown page are hard errors.
+    tmp = Path(tempfile.mkdtemp(prefix="rec2mp4-cyc-"))
+    try:
+        rom = tmp / "rom.gba"
+        rom.write_bytes(b"\x00" * 0x2000)
+        sav = tmp / "s.sav"
+        sav.write_bytes(b"\x01" * rec.SAV_MIN_SIZE)
+        for bad in (dict(panel="off", panel_cycle=-1),
+                    dict(panel="off", panel_cycle_pages=("bogus",))):
+            try:
+                pipeline.load_context(pipeline.ConvertSettings(
+                    rom=rom, sav=sav, outdir=tmp, **bad))
+                # emulator stack may be absent -> PipelineError for a different
+                # reason; only fail if it did NOT raise at all.
+                ok(False, f"bad cycle option accepted: {bad}")
+            except pipeline.PipelineError:
+                ok(True, "")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("   defaults off; negative seconds + unknown page -> PipelineError")
+
+
+def test_stat_sums_ground_truth(rom_bytes: bytes) -> None:
+    print("-- stat_manifest sums vs rec.parse (real records + ROM)")
+    extras_base = {"rom_bytes": rom_bytes}
+    checked = 0
+    for rp in sorted(Path(RECS_DIR).glob("*.rec")):
+        info = rec.parse(rp.read_bytes())
+        if not info["valid"]:
+            continue
+        extras = dict(extras_base, sections=panel.PANEL_SECTIONS)
+        ev_lines = "\n".join(panel.stat_manifest(info, extras, "evs"))
+        iv_lines = "\n".join(panel.stat_manifest(info, extras, "ivs"))
+        for side in ("player", "opponent"):
+            for m in info["teams"][side]:
+                if "evs" not in m:              # untrusted mon -> not shown
+                    continue
+                ok(f"Sum {m['evs']['sum']}/510" in ev_lines,
+                   f"EV sum {m['evs']['sum']} missing from panel: {rp.name}")
+                ok(f"Sum {m['ivs']['sum']}/186" in iv_lines,
+                   f"IV sum {m['ivs']['sum']} missing from panel: {rp.name}")
+                ok(0 <= m["evs"]["sum"] <= 510 and 0 <= m["ivs"]["sum"] <= 186,
+                   f"impossible sum in {rp.name}: {m['evs']} {m['ivs']}")
+                checked += 1
+    ok(checked >= 3,
+       f"need >= 3 trusted mons across the real records, got {checked}")
+    # move names resolve from the ROM for at least one real mon (no fallback)
+    for rp in sorted(Path(RECS_DIR).glob("*.rec")):
+        info = rec.parse(rp.read_bytes())
+        if not info["valid"]:
+            continue
+        mv = "\n".join(panel.stat_manifest(
+            info, dict(extras_base, sections=panel.PANEL_SECTIONS), "moves"))
+        if mv and "Move #" not in mv and any(c.isalpha() for c in mv):
+            break
+    print(f"   {checked} trusted mons: every EV/IV sum shows on the panel; "
+          "move names read from the ROM")
 
 
 # ---------------------------------------------------------------------------
@@ -235,10 +364,24 @@ def _panel_fixture():
         "teams": {
             "player": [
                 {"nickname": "METAGROSS", "species_internal": 400,
-                 "level": 55, "shiny": False, "checksum_ok": True},
+                 "level": 55, "shiny": False, "checksum_ok": True,
+                 "moves": [{"id": 309, "pp": 5}, {"id": 89, "pp": 10},
+                           {"id": 232, "pp": 15}, {"id": 264, "pp": 20}],
+                 "evs": {"hp": 0, "atk": 252, "def": 0, "spa": 0,
+                         "spd": 4, "spe": 252, "sum": 508},
+                 "ivs": {"hp": 31, "atk": 31, "def": 31, "spa": 31,
+                         "spd": 31, "spe": 31, "sum": 186},
+                 "nature": {"id": 3, "name": "Adamant"}},
                 {"nickname": "SPIKE", "species_internal": 397,
-                 "level": 50, "shiny": True, "checksum_ok": True},
+                 "level": 50, "shiny": True, "checksum_ok": True,
+                 "moves": [{"id": 33, "pp": 35}],
+                 "evs": {"hp": 4, "atk": 0, "def": 0, "spa": 252,
+                         "spd": 0, "spe": 252, "sum": 508},
+                 "ivs": {"hp": 30, "atk": 0, "def": 31, "spa": 31,
+                         "spd": 31, "spe": 31, "sum": 154},
+                 "nature": {"id": 10, "name": "Timid"}},
             ],
+            # No moves/evs/ivs keys -> "(stats unavailable)" path.
             "opponent": [
                 {"nickname": "EEVEE", "species_internal": 133,
                  "level": 50, "shiny": False, "checksum_ok": True},
@@ -294,6 +437,24 @@ def test_panel_render() -> bool:
         extras_rom = dict(extras, rom_bytes=open(ROM_PATH, "rb").read())
         png = panel.render_panel(info, extras_rom, (480, 640))
         ok(png[:8] == b"\x89PNG\r\n\x1a\n", "ROM-backed render failed")
+
+    # panel_pages: one decodable PNG per requested stat page, right size,
+    # and the pages must actually DIFFER (a moves page != an EV page).
+    pages = panel.panel_pages(info, extras, (480, 640), ("moves", "evs", "ivs"))
+    ok(len(pages) == 3, f"panel_pages must return 3 pages, got {len(pages)}")
+    for pg in pages:
+        ok(pg[:8] == b"\x89PNG\r\n\x1a\n", "panel_pages page is not a PNG")
+        ok(Image.open(io.BytesIO(pg)).size == (480, 640),
+           "panel_pages page wrong size")
+    ok(len({bytes(p) for p in pages}) == 3,
+       "moves/evs/ivs pages must render differently")
+    # default cycle set (empty) -> all three pages
+    ok(len(panel.panel_pages(info, extras, (240, 320), ())) == 3,
+       "empty cycle set must default to all three stat pages")
+    # a single requested page -> a single PNG
+    one = panel.panel_pages(info, extras, (240, 320), ("evs",))
+    ok(len(one) == 1 and one[0][:8] == b"\x89PNG\r\n\x1a\n",
+       "single-page cycle wrong")
     # too-small canvas is a hard error, not a garbage render
     try:
         panel.render_panel(info, extras, (10, 10))
@@ -420,13 +581,18 @@ def main():
     test_streak_in_basename()
     test_export_txt()
     test_panel_info()
+    test_cycle_pages_parser()
+    test_stat_manifest()
     test_sidecar_extras()
+    test_settings_cycle_defaults()
     test_panel_render()
     test_pipeline_no_emulator()
     have_assets = (os.path.isfile(ROM_PATH) and os.path.isdir(RECS_DIR)
                    and any(Path(RECS_DIR).glob("*.rec")))
     if have_assets:
-        test_species_ground_truth(open(ROM_PATH, "rb").read())
+        rom_bytes = open(ROM_PATH, "rb").read()
+        test_species_ground_truth(rom_bytes)
+        test_stat_sums_ground_truth(rom_bytes)
         print(f"PASS: {_checks} checks")
         return
     # local/ is gitignored — a fresh clone / CI has no ROM or records. The

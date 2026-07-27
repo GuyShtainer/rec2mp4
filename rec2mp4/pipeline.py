@@ -151,6 +151,9 @@ class ConvertSettings:
     panel: str = "right"              # right | left | off
     panel_info: str = "all"           # CSV of panel.PANEL_SECTIONS
     pov: str = "player"               # player | opponent (experimental)
+    panel_cycle: float = 0.0          # seconds per stat page; 0 = static panel
+    panel_cycle_pages: tuple = ()     # which of moves/evs/ivs to cycle
+                                      # ((): all three when panel_cycle > 0)
 
 
 @dataclass
@@ -168,6 +171,8 @@ class ConvertContext:
     writer_accepts_log: bool
     panel_enabled: bool
     panel_sections: tuple
+    panel_cycle: float = 0.0
+    panel_cycle_pages: tuple = ()
     used_out_paths: set = field(default_factory=set)
 
 
@@ -249,6 +254,21 @@ def load_context(settings: ConvertSettings, log: Callable = print,
         panel_sections = panel_mod.parse_panel_info(settings.panel_info)
     except ValueError as exc:
         raise PipelineError(str(exc)) from exc
+    # --- stat-cycling options (validated even when the panel is off) ------
+    try:
+        panel_cycle = float(settings.panel_cycle or 0.0)
+    except (TypeError, ValueError):
+        raise PipelineError(
+            f"--panel-cycle must be a number of seconds "
+            f"(got {settings.panel_cycle!r})")
+    if panel_cycle < 0:
+        raise PipelineError(
+            f"--panel-cycle must be >= 0 (got {panel_cycle})")
+    try:
+        panel_cycle_pages = panel_mod.parse_cycle_pages(
+            settings.panel_cycle_pages)
+    except ValueError as exc:
+        raise PipelineError(str(exc)) from exc
     panel_enabled = settings.panel in ("right", "left")
     if panel_enabled and not pillow_available():
         panel_enabled = False
@@ -262,7 +282,8 @@ def load_context(settings: ConvertSettings, log: Callable = print,
         rom_bytes=rom_bytes, rom_crc32=rom_crc32, sav_bytes=sav_bytes,
         driver_mod=driver_mod, video_mod=video_mod,
         writer_kwargs=writer_kwargs, writer_accepts_log=writer_accepts_log,
-        panel_enabled=panel_enabled, panel_sections=panel_sections)
+        panel_enabled=panel_enabled, panel_sections=panel_sections,
+        panel_cycle=panel_cycle, panel_cycle_pages=panel_cycle_pages)
 
 
 # ---------------------------------------------------------------------------
@@ -548,12 +569,12 @@ def read_export_txt(rec_path: Path) -> list[str] | None:
 # during the replay — the panel is stacked on at finalize time)
 # ---------------------------------------------------------------------------
 
-def _render_panel_png(info: dict, settings: ConvertSettings,
-                      ctx: ConvertContext, replay_result,
-                      streak: int | None,
-                      export_info: list[str] | None) -> bytes:
-    from . import panel as panel_mod
-    extras = {
+def _panel_extras(info: dict, settings: ConvertSettings,
+                  ctx: ConvertContext, replay_result,
+                  streak: int | None,
+                  export_info: list[str] | None) -> dict:
+    """The `extras` dict shared by the static PNG and the cycling pages."""
+    return {
         "rom_bytes": ctx.rom_bytes,
         "outcome_text": getattr(replay_result, "outcome_text", "unknown"),
         "duration_seconds": getattr(replay_result, "seconds", None),
@@ -565,9 +586,21 @@ def _render_panel_png(info: dict, settings: ConvertSettings,
         "pov": settings.pov,
         "pov_faithful": pov_faithful(info),
     }
-    size = (settings.scale * PANEL_WIDTH_UNITS,
+
+
+def _panel_size(settings: ConvertSettings) -> tuple[int, int]:
+    return (settings.scale * PANEL_WIDTH_UNITS,
             settings.scale * PANEL_HEIGHT_UNITS)
-    return panel_mod.render_panel(info, extras, size)
+
+
+def _render_panel_png(info: dict, settings: ConvertSettings,
+                      ctx: ConvertContext, replay_result,
+                      streak: int | None,
+                      export_info: list[str] | None) -> bytes:
+    from . import panel as panel_mod
+    extras = _panel_extras(info, settings, ctx, replay_result,
+                           streak, export_info)
+    return panel_mod.render_panel(info, extras, _panel_size(settings))
 
 
 def _composite_panel(video_path: str, png_bytes: bytes, side: str,
@@ -620,6 +653,119 @@ def _composite_panel(video_path: str, png_bytes: bytes, side: str,
         out_tmp = None
     finally:
         for p in (png_tmp, out_tmp):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+
+def _probe_duration(ffmpeg: str, path: str) -> float | None:
+    """Container duration in seconds via ffprobe (ffmpeg's sibling), or None."""
+    ffprobe = os.path.join(os.path.dirname(ffmpeg), "ffprobe")
+    if not os.path.isfile(ffprobe):
+        ffprobe = "ffprobe"
+    try:
+        res = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", path],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        return float(res.stdout.decode("ascii", "replace").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _composite_panel_cycle(video_path: str, page_pngs: list[bytes], side: str,
+                           video_mod, seconds_per_page: float,
+                           game_seconds: float, size: tuple[int, int],
+                           log: Callable = print) -> None:
+    """hstack a TIME-CYCLING panel beside the game video, atomically.
+
+    Each page PNG is held for `seconds_per_page`; the sequence loops enough
+    whole cycles to cover the game's duration, and hstack's shortest=1 clips
+    the (slightly longer) panel track to the game so the two line up. The
+    panel track is built with the concat demuxer (one entry per page with an
+    explicit `duration`), scaled to the panel size and normalised to the GBA
+    frame rate. Audio is stream-copied; on any ffmpeg error the original video
+    is left untouched. Verifies the muxed duration with ffprobe.
+    """
+    if not page_pngs:
+        raise RuntimeError("no panel pages to cycle")
+    ffmpeg = video_mod._find_ffmpeg()
+    out_dir = os.path.dirname(video_path) or "."
+    base = os.path.basename(video_path)
+    fps = "%d/%d" % video_mod.GBA_FPS
+    w, h = int(size[0]), int(size[1])
+
+    # How many page-slots to cover the game (+ one extra so shortest=1, not a
+    # too-short panel, decides the end): ceil(game / per_page) + 1.
+    per = max(0.1, float(seconds_per_page))
+    slots = int(game_seconds / per) + 2
+    n = len(page_pngs)
+
+    tmp_pngs: list[str] = []
+    list_path = None
+    out_tmp = None
+    try:
+        for i, data in enumerate(page_pngs):
+            fd, p = tempfile.mkstemp(prefix=f".{base}.page{i}.",
+                                     suffix=".png", dir=out_dir)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            tmp_pngs.append(p)
+
+        # concat demuxer script: `file`/`duration` pairs; the LAST file must be
+        # repeated once more (a known demuxer quirk) so its duration counts.
+        lines = ["ffconcat version 1.0"]
+        for k in range(slots):
+            p = tmp_pngs[k % n]
+            lines.append("file '%s'" % p.replace("'", r"'\''"))
+            lines.append("duration %.4f" % per)
+        lines.append("file '%s'" % tmp_pngs[(slots - 1) % n]
+                     .replace("'", r"'\''"))
+        fd, list_path = tempfile.mkstemp(prefix=f".{base}.pages.",
+                                         suffix=".txt", dir=out_dir)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+
+        panel_scale = ("[1:v]scale=%d:%d,fps=%s,setsar=1[p]" % (w, h, fps))
+        if side == "left":
+            fc = panel_scale + ";[p][0:v]hstack=inputs=2:shortest=1[v]"
+        else:
+            fc = panel_scale + ";[0:v][p]hstack=inputs=2:shortest=1[v]"
+
+        fd, out_tmp = tempfile.mkstemp(prefix=f".{base}.panelmux.",
+                                       suffix=".mp4", dir=out_dir)
+        os.close(fd)
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+               "-i", video_path,
+               "-f", "concat", "-safe", "0", "-i", list_path,
+               "-filter_complex", fc,
+               "-map", "[v]", "-map", "0:a?",
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+               "-pix_fmt", "yuv420p",
+               "-c:a", "copy",
+               "-shortest", "-movflags", "+faststart",
+               out_tmp]
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE)
+        if res.returncode != 0:
+            tail = res.stderr.decode("utf-8", "replace").strip()[-2000:]
+            raise RuntimeError(
+                f"ffmpeg cycling-panel composite failed "
+                f"(exit {res.returncode}):\n"
+                f"{tail or '(no ffmpeg stderr captured)'}")
+        # Durations must line up: the muxed output should track the game.
+        dur = _probe_duration(ffmpeg, out_tmp)
+        if dur is not None and game_seconds > 0 \
+                and abs(dur - game_seconds) > max(1.0, 0.1 * game_seconds):
+            raise RuntimeError(
+                f"cycling-panel output duration {dur:.2f}s does not match the "
+                f"game video {game_seconds:.2f}s")
+        os.replace(out_tmp, video_path)
+        out_tmp = None
+    finally:
+        for p in ([list_path, out_tmp] + tmp_pngs):
             if p:
                 try:
                     os.unlink(p)
@@ -741,7 +887,17 @@ def convert_one(rec_path, settings: ConvertSettings, log: Callable = print,
         # runs last, so the final checksum is correct). Experimental —
         # faithful only for genuine link records (see rec.to_opponent_pov).
         if settings.pov == "opponent":
-            data = rec.to_opponent_pov(data)
+            # For a vs-AI Frontier record, label the bottom (now-watched)
+            # trainer with the REAL NPC's name from the ROM instead of the
+            # generic "FOE" placeholder. Only the on-screen NAME is
+            # corrected; the link character SPRITE stays a generic player
+            # character (a limitation of the engine's link-replay path).
+            bottom_name = None
+            if info.get("opponent_a_kind") == "frontier":
+                bottom_name = romdata.frontier_trainer_rawname(
+                    ctx.rom_bytes, info["opponent_a"])
+            data = rec.to_opponent_pov(data, bottom_trainer_name=bottom_name)
+            log(f"  opponent POV name: {bottom_name or 'FOE'}")
             faithful = pov_faithful(info)
             log("  opponent POV (experimental): "
                 + ("faithful (genuine link record)" if faithful
@@ -781,18 +937,39 @@ def convert_one(rec_path, settings: ConvertSettings, log: Callable = print,
         # (composited / dropped). A GUI reads this to SHOW 'panel on/off'
         # per row so a silent drop can never masquerade as a full render.
         panel_applied = None
+        panel_mode = None               # "static" | "cycle" (for the sidecar)
+        panel_cycle_pages_used: tuple = ()
         if settings.panel != "off":
             panel_applied = False
         if ctx.panel_enabled:
             try:
-                png = _render_panel_png(info, settings, ctx, result,
-                                        streak, export_info)
-                _composite_panel(str(final_path), png, settings.panel,
-                                 ctx.video_mod)
+                from . import panel as panel_mod
+                size = _panel_size(settings)
+                if ctx.panel_cycle > 0:
+                    extras = _panel_extras(info, settings, ctx, result,
+                                           streak, export_info)
+                    panel_cycle_pages_used = panel_mod.parse_cycle_pages(
+                        ctx.panel_cycle_pages)
+                    pages = panel_mod.panel_pages(
+                        info, extras, size, panel_cycle_pages_used)
+                    _composite_panel_cycle(
+                        str(final_path), pages, settings.panel, ctx.video_mod,
+                        ctx.panel_cycle, result.seconds, size, log=log)
+                    panel_mode = "cycle"
+                    log(f"panel: {settings.panel} cycling info panel "
+                        f"composited ({size[0]}x{size[1]}, "
+                        f"{len(pages)} page(s) "
+                        f"[{', '.join(panel_cycle_pages_used)}] @ "
+                        f"{ctx.panel_cycle:g}s each)")
+                else:
+                    png = _render_panel_png(info, settings, ctx, result,
+                                            streak, export_info)
+                    _composite_panel(str(final_path), png, settings.panel,
+                                     ctx.video_mod)
+                    panel_mode = "static"
+                    log(f"panel: {settings.panel} side info panel composited "
+                        f"({size[0]}x{size[1]})")
                 panel_applied = True
-                log(f"panel: {settings.panel} side info panel composited "
-                    f"({settings.scale * PANEL_WIDTH_UNITS}x"
-                    f"{settings.scale * PANEL_HEIGHT_UNITS})")
             except Exception as exc:
                 err(f"panel failed ({type(exc).__name__}: {exc}) — "
                     "video kept without the panel")
@@ -813,6 +990,14 @@ def convert_one(rec_path, settings: ConvertSettings, log: Callable = print,
             if settings.panel != "off":
                 options["panel"] = (settings.panel if ctx.panel_enabled
                                     else "off (Pillow missing)")
+                # Record HOW the panel was drawn so the sidecar tells static
+                # from a time-cycling panel (and which pages / at what cadence).
+                if panel_mode is not None:
+                    options["panel_mode"] = panel_mode
+                    if panel_mode == "cycle":
+                        options["panel_cycle_seconds"] = ctx.panel_cycle
+                        options["panel_cycle_pages"] = list(
+                            panel_cycle_pages_used)
             pov_meta = None
             if settings.pov == "opponent":
                 pov_meta = {"pov": "opponent",

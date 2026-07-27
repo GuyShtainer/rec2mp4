@@ -117,6 +117,43 @@ def test_settings_marshalling():
     print("   overrides, CSV sections, empty->off degrade, bad scale raises")
 
 
+def test_settings_cycle():
+    print("-- settings_from_form() stat-cycle controls")
+    from rec2mp4.panel import STAT_PAGE_SECTIONS
+    # default form: cycling OFF (0 seconds), all three pages pre-selected
+    s = gui.settings_from_form(gui.default_form())
+    ok(s.panel_cycle == 0.0, f"cycle must default off: {s.panel_cycle!r}")
+    ok(tuple(s.panel_cycle_pages) == tuple(STAT_PAGE_SECTIONS),
+       f"default cycle pages wrong: {s.panel_cycle_pages}")
+    # a numeric cycle + a page subset marshals through (string spinbox value)
+    form = gui.default_form()
+    form["panel_cycle"] = "5"
+    form["panel_cycle_pages"] = ["ivs", "moves"]
+    s = gui.settings_from_form(form)
+    ok(s.panel_cycle == 5.0, f"cycle seconds not coerced: {s.panel_cycle!r}")
+    ok(tuple(s.panel_cycle_pages) == ("moves", "ivs"),
+       f"cycle page subset/order wrong: {s.panel_cycle_pages}")
+    # empty page selection falls back to all three (never an empty cycle)
+    form["panel_cycle_pages"] = []
+    ok(tuple(gui.settings_from_form(form).panel_cycle_pages)
+       == tuple(STAT_PAGE_SECTIONS), "empty cycle pages must default to all")
+    # blank / bad cycle numbers
+    form["panel_cycle_pages"] = ["evs"]
+    form["panel_cycle"] = ""
+    ok(gui.settings_from_form(form).panel_cycle == 0.0,
+       "blank cycle must be 0")
+    for bad in ("x", -2):
+        form2 = gui.default_form()
+        form2["panel_cycle"] = bad
+        try:
+            gui.settings_from_form(form2)
+            ok(False, f"cycle {bad!r} accepted")
+        except ValueError:
+            ok(True, "")
+    print("   default off/all; numeric coerce + subset; empty->all; bad "
+          "raises")
+
+
 # ---------------------------------------------------------------------------
 # Queue model
 # ---------------------------------------------------------------------------
@@ -304,6 +341,7 @@ def test_widget_smoke():
 def main():
     test_settings_defaults()
     test_settings_marshalling()
+    test_settings_cycle()
     test_queue_model()
     test_row_formatting()
     test_status_formatting()
