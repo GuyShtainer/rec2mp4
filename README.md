@@ -169,3 +169,8 @@ exact 59.7275 fps. Addresses, decomp citations and the full state machine:
 - **Privacy note:** `.rec` files contain user data — player names, trainer IDs
   and teams of everyone in the recorded battle. Share them (and videos made
   from them) accordingly.
+- **Trademarks:** Pokémon, Game Boy Advance and related names are trademarks of
+  Nintendo, Creatures Inc. and GAME FREAK inc. This project is a fan-made tool,
+  not affiliated with or endorsed by any of them. Reverse-engineered knowledge
+  used here is limited to facts and RAM/save-layout addresses derived from the
+  pret decompilation project's published symbols; no game code is bundled.
