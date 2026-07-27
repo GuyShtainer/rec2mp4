@@ -1,0 +1,29 @@
+# User game data — never commit (ROMs, saves, battle records, captured video)
+*.gba
+*.sav
+*.sav.*
+*.ss*
+*.rec
+*.mp4
+*.mkv
+*.wav
+local/
+out/
+
+# Fetched mGBA python bindings (MPL-2.0) + copied libmgba dylib — never commit
+vendor/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Internal dev docs (session notes stay local)
+docs/HANDOFF.md
+
+# macOS
+.DS_Store
