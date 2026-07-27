@@ -228,6 +228,7 @@ class EmulatorDriver:
         self._capturing = False
         self._captured = 0
         self._outcome = 0
+        self._end_trimmed = False
 
         try:
             self._step_boot_to_intro()
@@ -243,7 +244,10 @@ class EmulatorDriver:
             self._step_wait_playback_start()
             self._step_wait_battle_running()
             self._step_wait_battle_end()
-            end_reason = "natural"
+            # A grace-trim past a decided outcome (opponent-POV desync) still
+            # yields a complete, watchable video up to the battle's real end —
+            # distinct from a menu stall or the global timeout.
+            end_reason = "trimmed" if self._end_trimmed else "natural"
         except _StepStall as exc:
             self._log(f"ERROR: {exc}")
             end_reason = f"error:{exc.step}"
@@ -681,8 +685,11 @@ class EmulatorDriver:
             self._log("WARNING: BATTLE_TYPE_RECORDED bit not set")
 
     def _step_wait_battle_end(self):
-        # Whitelist poll (replay-path §3); bounded only by max_seconds.
+        # Whitelist poll (replay-path §3); bounded by max_seconds and, once the
+        # outcome is decided, by OUTCOME_GRACE_FRAMES (so an opponent-POV
+        # desync can't run the whole 30 min in a garbled "??? ???" loop).
         last_progress = self._frames_run
+        outcome_frame = None
         while True:
             cb2 = self._cb2()
             if cb2 in S.REPLAY_END_CALLBACKS_T:
@@ -694,9 +701,20 @@ class EmulatorDriver:
                 outcome = self._u8(S.GBATTLE_OUTCOME)
                 if outcome:
                     self._outcome = outcome
+                    outcome_frame = self._frames_run
                     self._log(f"[f{self._frames_run}] battle outcome decided: "
                               f"{outcome} "
                               f"({OUTCOME_TEXT.get(outcome, '?')})")
+            elif (outcome_frame is not None
+                  and self._frames_run - outcome_frame >= S.OUTCOME_GRACE_FRAMES):
+                # Outcome decided long ago but no end callback fired — a
+                # desynced replay stuck past the battle. Trim here.
+                self._end_trimmed = True
+                self._log(f"[f{self._frames_run}] no end callback "
+                          f"{S.OUTCOME_GRACE_FRAMES} frames after the outcome — "
+                          "trimming (likely an opponent-POV desync past the "
+                          "battle's real end)")
+                break
             if self._frames_run - last_progress >= 600:
                 last_progress = self._frames_run
                 self._log(f"[f{self._frames_run}] battle in progress "

@@ -835,11 +835,16 @@ def convert_one(rec_path, settings: ConvertSettings, log: Callable = print,
                       end_reason=result.end_reason,
                       outcome_text=result.outcome_text,
                       info=info, streak=streak, panel_applied=panel_applied)
-        if result.end_reason == "natural":
+        if result.end_reason in ("natural", "trimmed"):
+            # "trimmed" = a complete video up to the battle's real end, cut
+            # short of a stuck post-battle loop (expected for an opponent-POV
+            # what-if of a vs-AI record). Report OK; note the trim.
             log(f"wrote {final_path}")
+            note = " [POV trimmed at battle end]" \
+                if result.end_reason == "trimmed" else ""
             return _result(name, "OK",
                            f"{result.frames}f {result.seconds:.1f}s "
-                           f"({result.end_reason}) -> {final_path}",
+                           f"({result.end_reason}){note} -> {final_path}",
                            **common)
         # timeout / mid-battle stall: keep the partial .mp4 for
         # inspection but never report the record as OK.

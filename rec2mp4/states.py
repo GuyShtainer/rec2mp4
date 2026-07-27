@@ -55,6 +55,16 @@ PASS_CURSOR_PHASE_TIMEOUT_FRAMES = 300
 # Video tail appended after the end-of-replay callback2 is observed (~2 s).
 END_TAIL_FRAMES = 120
 
+# Safety trim: once the battle outcome is decided (gBattleOutcome != 0), the
+# game normally reaches an end-of-replay callback within ~1 s. An opponent-POV
+# ("fake link") replay of a vs-AI record desyncs and can instead sit forever in
+# a garbled post-battle state (the "??? ???" textbox), which would otherwise run
+# the whole max_seconds (~30 min) and produce an unwatchable file. If the end
+# callbacks have not fired this many frames after the outcome was decided, stop
+# capture and end cleanly. ~20 s is far longer than any legitimate faint/win
+# sequence, so normal replays are never trimmed early.
+OUTCOME_GRACE_FRAMES = int(20 * FRAME_RATE)  # ~1194 frames
+
 # --------------------------------------------------------------------------
 # GBA key bitmasks (KEYINPUT layout; libmgba KEY_* constants are these bit
 # INDICES — the driver always passes masks via core.set_keys(raw=mask)).
