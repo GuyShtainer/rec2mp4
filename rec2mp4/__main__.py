@@ -80,6 +80,15 @@ def _build_parser() -> argparse.ArgumentParser:
                         "opponents, teams, export, footer — or 'all' "
                         "(default). 'export' shows the first lines of a "
                         "PokeDNA '<stem>.txt' info sidecar when present")
+    p.add_argument("--pov", choices=("player", "opponent"), default="player",
+                   help="whose side the camera is on. 'player' (default) is "
+                        "the normal replay; 'opponent' flips the camera to "
+                        "the opponent's side using the game's own link-replay "
+                        "path (their team at the bottom, yours as the enemy). "
+                        "EXPERIMENTAL: faithful only for genuine link-battle "
+                        "records; for Frontier (vs-AI) records it is a "
+                        "'what-if' — the opponent's moves are re-decided and "
+                        "diverge after ~turn 1, so the video may end early")
     p.add_argument("--plain-names", action="store_true",
                    help="name outputs '<stem>.mp4' instead of the default "
                         "'<stem> - <facility> <level> vs <opponent>.mp4' "
@@ -154,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
             plain_names=args.plain_names, sidecar=not args.no_sidecar,
             pix_fmt=args.pix_fmt, max_seconds=args.max_seconds,
             headed=args.headed, panel=args.panel,
-            panel_info=args.panel_info)
+            panel_info=args.panel_info, pov=args.pov)
         try:
             ctx = load_context(settings)
         except PipelineError as exc:

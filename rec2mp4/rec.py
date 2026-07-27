@@ -61,6 +61,11 @@ FLAG_MULTI = 1 << 6
 FLAG_TWO_OPPONENTS = 1 << 15
 FLAG_RECORDED_LINK = 1 << 25
 
+# battleFlags bits the opponent-POV transform touches (BATTLE_TYPE_* in the
+# decomp include/constants/battle.h — reference only).
+FLAG_IS_MASTER = 1 << 2           # BATTLE_TYPE_IS_MASTER
+FLAG_RECORDED_IS_MASTER = 1 << 31  # BATTLE_TYPE_RECORDED_IS_MASTER (perspective)
+
 # Sector 31 location inside a 128 KiB .sav
 SAV_SECTOR31_OFF = 0x1F000
 SAV_MIN_SIZE = 0x20000
@@ -101,6 +106,33 @@ def _g3str(raw: bytes) -> str:
             break
         out.append(_g3chr(b))
     return ''.join(out).strip()
+
+
+# Encode-side specials (inverse of _g3chr's dict, letters handled by range).
+_G3_SPECIALS = {' ': 0x00, '!': 0xAB, '?': 0xAC, '.': 0xAD, '-': 0xAE,
+                "'": 0xB4, ',': 0xB8, '/': 0xBA, ':': 0xF0}
+
+
+def _g3encode(text: str, length: int = 8) -> bytes:
+    """Encode ASCII to the Gen-3 charset (inverse of _g3chr), 0xFF-terminated.
+
+    Produces exactly `length` bytes: the encoded glyphs, a 0xFF EOS, then
+    0xFF padding — the on-cart form of a trainer name slot. Unencodable
+    characters are dropped; the text is truncated to leave room for EOS.
+    """
+    out = bytearray()
+    for c in text[:length - 1]:
+        if 'A' <= c <= 'Z':
+            out.append(0xBB + ord(c) - ord('A'))
+        elif 'a' <= c <= 'z':
+            out.append(0xD5 + ord(c) - ord('a'))
+        elif '0' <= c <= '9':
+            out.append(0xA1 + ord(c) - ord('0'))
+        elif c in _G3_SPECIALS:
+            out.append(_G3_SPECIALS[c])
+    out.append(0xFF)                         # EOS
+    out += b'\xFF' * (length - len(out))
+    return bytes(out[:length])
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +378,119 @@ def patch_options(rec: bytes, animations: bool | None = None,
     out[STRUCT_OFF + CHECKSUM_RANGE:
         STRUCT_OFF + CHECKSUM_RANGE + 4] = csum.to_bytes(4, "little")
     return bytes(out)
+
+
+# Fabricated identity for the link player that ends up at the bottom after
+# the POV flip (a fake-link record's bottom trainer is always drawn as a
+# player character — the frontier trainer's class art cannot appear there,
+# see docs/research/opponent-pov.md §1.4). Name kept short/valid.
+_POV_FAKE_NAME = "FOE"
+_POV_FAKE_TRAINER_ID = 0x00003F3F        # any nonzero (low 16 = visible ID)
+
+
+def to_opponent_pov(rec: bytes) -> bytes:
+    """Transform a record so playback renders from the OPPONENT's side.
+
+    Implements the "fake link record" (H2) transform from
+    docs/research/opponent-pov.md §2.1. The game only offers a
+    perspective switch for link records, so this dresses the record up as a
+    non-master ``RECORDED_LINK`` battle: the two 600-byte party blocks are
+    swapped, the flags are rewritten, a link-player identity is fabricated
+    for the trainer that now sits at the bottom, and ``multiplayerId`` points
+    at it. The engine's link-replay controllers then draw the (former)
+    opponent's team at the bottom with player-style HP boxes and the
+    recorder's team as the enemy at the top, with every recorded action
+    correctly attributed — the input lanes are indexed by battler id and are
+    left untouched.
+
+    FAITHFUL ONLY FOR GENUINE LINK RECORDS (battleFlags already had
+    ``RECORDED_LINK``). For the vs-AI Frontier records this project handles,
+    the replay provably diverges after ~turn 1 — the opponent AI's ``Random``
+    consumption at playback cannot be reproduced from the record — and ends
+    early through the engine's lane-exhaustion teleport bailout (a clean fade
+    to black, ``B_OUTCOME_PLAYER_TELEPORTED``; no crash). It is a "what-if"
+    view of a Frontier battle, not the battle as it happened. See the
+    research doc §1.5 for why.
+
+    Byte transform (offsets relative to the struct at +4):
+      * playerParty(+0) <-> opponentParty(+600), 600 bytes each
+      * battleFlags(+1260): ``|= RECORDED_LINK``, ``&= ~IS_MASTER``,
+        ``&= ~RECORDED_IS_MASTER`` (bit 31 clear = opponent-side render)
+      * playersName[1](+1208), playersGender[1](+1233)=0,
+        playersTrainerId[1](+1240)=nonzero, playersLanguage[1](+1253)=2
+        -- FAKE-LINK records only; a genuine RECORDED_LINK record keeps its
+        real opponent identity so the faithful view labels the real trainer.
+      * playersBattlers(+1264)=[0,1,0,0], multiplayerId(+1274)=1
+      * battleRecord lanes(+1308): unchanged
+      * checksum(+3964): recomputed
+
+    SINGLE battles only: raises RecError for a double/multi record, whose
+    four-lane battler layout the fixed step-4 mapping cannot represent.
+
+    The caller's bytes are never modified. Raises RecError if the input is
+    not a valid record; the output is re-validated (must return []).
+    """
+    errors = validate(rec)
+    if errors:
+        raise RecError("refusing to POV-transform an invalid record: "
+                       + "; ".join(errors))
+    out = bytearray(rec)
+    base = STRUCT_OFF
+    foff = base + 1260
+    orig_flags = int.from_bytes(out[foff:foff + 4], "little")
+
+    # SINGLE battles only. The fixed battler layout written in step 4
+    # (playersBattlers=[0,1,0,0], multiplayerId=1) maps a two-lane singles
+    # record. A double/multi record has four populated battler lanes that
+    # this layout would mis-attribute, so refuse rather than emit a
+    # structurally-valid but wrongly-mapped replay.
+    if orig_flags & (FLAG_DOUBLE | FLAG_MULTI):
+        raise RecError("opponent POV is only supported for single battles "
+                       "(this record is a double/multi battle)")
+
+    # A genuine link record (RECORDED_LINK already set) carries both real
+    # trainers' identities; only a fake-link (vs-AI Frontier) record needs a
+    # fabricated bottom trainer. Preserving the real name/id is what makes
+    # the link flip faithful (docs/research/opponent-pov.md §3).
+    genuine_link = bool(orig_flags & FLAG_RECORDED_LINK)
+
+    # 1. Swap the two 600-byte party blocks (parties are bound to sides).
+    p0, p1 = base + 0, base + 600
+    player_party = bytes(out[p0:p0 + 600])
+    out[p0:p0 + 600] = out[p1:p1 + 600]
+    out[p1:p1 + 600] = player_party
+
+    # 2. battleFlags -> non-master RECORDED_LINK (renders opponent side).
+    flags = (orig_flags | FLAG_RECORDED_LINK) & ~FLAG_IS_MASTER \
+        & ~FLAG_RECORDED_IS_MASTER & 0xFFFFFFFF
+    out[foff:foff + 4] = flags.to_bytes(4, "little")
+
+    # 3. Fabricate link-player slot 1 (the trainer now at the bottom) — only
+    #    for a fake-link record. A genuine link record keeps its real
+    #    opponent name/id/language so the faithful view labels the real
+    #    trainer, not "FOE".
+    if not genuine_link:
+        out[base + 1208:base + 1216] = _g3encode(_POV_FAKE_NAME, 8)
+        out[base + 1233] = 0                                   # gender male
+        out[base + 1240:base + 1244] = \
+            _POV_FAKE_TRAINER_ID.to_bytes(4, "little")
+        out[base + 1253] = 2                                   # language ENG
+
+    # 4. Battler positions + viewer slot: battler 1 renders at the bottom.
+    out[base + 1264:base + 1268] = bytes((0, 1, 0, 0))         # playersBattlers
+    out[base + 1274:base + 1276] = (1).to_bytes(2, "little")   # multiplayerId
+
+    # 5. Lanes untouched (battler-indexed). Recompute the struct checksum.
+    csum = sum(out[base:base + CHECKSUM_RANGE]) & 0xFFFFFFFF
+    out[base + CHECKSUM_RANGE:base + CHECKSUM_RANGE + 4] = \
+        csum.to_bytes(4, "little")
+
+    result = bytes(out)
+    errors = validate(result)
+    if errors:                               # defensive: must never happen
+        raise RecError("internal error: opponent-POV transform produced an "
+                       "invalid record: " + "; ".join(errors))
+    return result
 
 
 def summarize(info: dict) -> str:
