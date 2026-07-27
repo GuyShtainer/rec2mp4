@@ -68,6 +68,63 @@ def _default_err(msg: object) -> None:
     print(msg, file=sys.stderr)
 
 
+# The interpreter that has the whole stack (Pillow + vendored mGBA + ffmpeg)
+# — named in every "install/relaunch here" message so the user can copy it.
+CONDA_PYTHON = "~/miniconda3/envs/rec2mp4/bin/python"
+
+
+def pillow_available() -> bool:
+    """True if Pillow can be imported in THIS interpreter.
+
+    The single side-panel probe, shared by load_context (which degrades the
+    panel when it is False) and any front-end that wants to warn *before*
+    converting instead of silently dropping the panel. No import side effects
+    beyond Pillow's own.
+    """
+    try:
+        import PIL  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def pillow_hint(interpreter: str | None = None) -> str:
+    """One actionable sentence naming this interpreter + how to get Pillow."""
+    py = interpreter or sys.executable or "this Python"
+    return (
+        f"the info panel needs Pillow, which {py} does not have. "
+        f"Install it here:  {py} -m pip install pillow  — or relaunch the GUI "
+        f"with the rec2mp4 conda env:  {CONDA_PYTHON} -m rec2mp4.gui  — "
+        "or set the side panel to 'off'.")
+
+
+def stack_status() -> dict:
+    """Probe THIS interpreter for the optional heavy deps a conversion needs.
+
+    Pure detection, no exceptions escape: front-ends call it at launch to tell
+    the user (loudly) when they are running under a Python where a full
+    conversion cannot produce the panel (Pillow) or any video (mGBA bindings /
+    ffmpeg). `ok` is True only when everything a default conversion uses is
+    present.
+    """
+    status = {"interpreter": sys.executable, "pillow": pillow_available(),
+              "emulator": False, "ffmpeg": False, "errors": {}}
+    try:
+        from . import driver as _driver  # noqa: F401
+        from . import video as _video
+        status["emulator"] = True
+        try:
+            _video._find_ffmpeg()
+            status["ffmpeg"] = True
+        except Exception as exc:                      # ffmpeg not on PATH
+            status["errors"]["ffmpeg"] = str(exc)
+    except Exception as exc:                          # bindings missing
+        status["errors"]["emulator"] = str(exc)
+    status["ok"] = (status["pillow"] and status["emulator"]
+                    and status["ffmpeg"])
+    return status
+
+
 # ---------------------------------------------------------------------------
 # Settings + per-batch context
 # ---------------------------------------------------------------------------
@@ -93,6 +150,7 @@ class ConvertSettings:
     headed: bool = False
     panel: str = "right"              # right | left | off
     panel_info: str = "all"           # CSV of panel.PANEL_SECTIONS
+    pov: str = "player"               # player | opponent (experimental)
 
 
 @dataclass
@@ -192,18 +250,10 @@ def load_context(settings: ConvertSettings, log: Callable = print,
     except ValueError as exc:
         raise PipelineError(str(exc)) from exc
     panel_enabled = settings.panel in ("right", "left")
-    if panel_enabled:
-        try:
-            import PIL  # noqa: F401
-        except ImportError:
-            panel_enabled = False
-            err("warning: side panel disabled — Pillow is not installed in "
-                "this Python.\n"
-                "  Install it in the rec2mp4 conda env:  "
-                "~/miniconda3/envs/rec2mp4/bin/python "
-                "-m pip install pillow\n"
-                "  (or run with --panel off to silence this). Videos will "
-                "be written without the info panel.")
+    if panel_enabled and not pillow_available():
+        panel_enabled = False
+        err("warning: side panel disabled — " + pillow_hint()
+            + " Videos will be written without the info panel.")
 
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -274,21 +324,53 @@ def opponent_label(info: dict, which: str,
     return f"trainer {opp_id}"
 
 
+POV_TAG = " [opponent POV]"
+
+
+def pov_faithful(info: dict) -> bool:
+    """True when an opponent-POV flip of this record would be FAITHFUL.
+
+    Only genuine link records (battleFlags already carrying RECORDED_LINK)
+    replay correctly from the other side — both lanes were human-recorded and
+    no AI runs at playback. Frontier vs-AI records (the ones this project
+    handles) are a "what-if": the replay diverges after ~turn 1. See
+    docs/research/opponent-pov.md §1.5.
+    """
+    return bool(info.get("is_link_recorded"))
+
+
+def pov_note(info: dict) -> str:
+    """Human caveat string recorded in the sidecar for opponent-POV outputs."""
+    if pov_faithful(info):
+        return ("Genuine link record: the opponent-side view is faithful — "
+                "both sides' inputs were human-recorded, so the replay "
+                "matches the real battle.")
+    return ("What-if view: this is a vs-AI Frontier record, so the "
+            "opponent-side replay is NOT the battle as it happened. The "
+            "opponent AI's moves are re-decided and diverge after ~turn 1; "
+            "the video may end early via the engine's clean teleport-quit "
+            "fade. See docs/research/opponent-pov.md.")
+
+
 def build_output_basename(info: dict, stem: str,
                           rom_bytes: bytes | None,
                           plain: bool = False,
-                          streak: int | None = None) -> str:
+                          streak: int | None = None,
+                          pov: str = "player") -> str:
     """'<stem> - <Facility> <Open|Lv50>[ <kind>] vs <Opp>[ and <OppB>]
-    [ (streak N)]'.
+    [ (streak N)][ [opponent POV]]'.
 
     Windows-safe ASCII, no extension. plain=True keeps just the stem
-    (streak included only in rich mode). Capped at 180 chars so
-    '<base> (NN).mp4'/'.json' and Mp4Writer's temp file stay under every
-    OS's 255-byte per-name limit.
+    (streak included only in rich mode); the opponent-POV tag is appended in
+    both modes. Capped at 180 chars so '<base> (NN).mp4'/'.json' and
+    Mp4Writer's temp file stay under every OS's 255-byte per-name limit.
     """
+    tag = POV_TAG if pov == "opponent" else ""
     if plain:
-        base = sanitize_filename(stem)
-        return base[:180].rstrip(" .") or "record"
+        # Reserve room for the tag BEFORE the cap so a long stem can never
+        # slice the honest " [opponent POV]" suffix off the end.
+        base = sanitize_filename(stem)[:180 - len(tag)].rstrip(" .")
+        return (base + tag) or "record"
     level = "Open" if info.get("level_mode") == "Open Level" else "Lv50"
     kind = ""
     for token, key in (("multi", "is_multi"),
@@ -305,7 +387,10 @@ def build_output_basename(info: dict, stem: str,
     base = f"{stem} - {info.get('facility', '?')} {level}{kind} vs {opp}"
     if streak is not None:
         base += f" (streak {streak})"
-    return sanitize_filename(base)[:180].rstrip(" .") or "record"
+    # Reserve room for the tag BEFORE the cap so a long stem/opponent name
+    # can never slice the honest " [opponent POV]" suffix off the end.
+    base = sanitize_filename(base)[:180 - len(tag)].rstrip(" .")
+    return (base + tag) or "record"
 
 
 def resolve_output_path(outdir: Path, base: str, source_rec_name: str,
@@ -344,7 +429,8 @@ def resolve_output_path(outdir: Path, base: str, source_rec_name: str,
 def build_sidecar(*, source_rec_name: str, rec_bytes: bytes, info: dict,
                   rom_crc32: int, options: dict, result,
                   output_name: str, streak: int | None = None,
-                  export_info: list[str] | None = None) -> dict:
+                  export_info: list[str] | None = None,
+                  pov_meta: dict | None = None) -> dict:
     """All the data we know about one conversion, JSON-serializable."""
     sc = {
         "rec2mp4_version": __version__,
@@ -370,6 +456,10 @@ def build_sidecar(*, source_rec_name: str, rec_bytes: bytes, info: dict,
         sc["streak"] = streak
     if export_info is not None:
         sc["export_info"] = export_info
+    # Opponent-POV outputs record the mode + an honest faithfulness verdict
+    # and caveat; player-POV (default) sidecars stay byte-identical.
+    if pov_meta is not None:
+        sc.update(pov_meta)
     return sc
 
 
@@ -472,6 +562,8 @@ def _render_panel_png(info: dict, settings: ConvertSettings,
         "sections": ctx.panel_sections,
         "opponent_a_label": opponent_label(info, "a", ctx.rom_bytes),
         "opponent_b_label": opponent_label(info, "b", ctx.rom_bytes),
+        "pov": settings.pov,
+        "pov_faithful": pov_faithful(info),
     }
     size = (settings.scale * PANEL_WIDTH_UNITS,
             settings.scale * PANEL_HEIGHT_UNITS)
@@ -545,6 +637,11 @@ def _result(name: str, status: str, detail: str, **over) -> dict:
         "output": None, "sidecar": None,
         "frames": 0, "seconds": 0.0, "end_reason": None,
         "outcome_text": None, "error": None, "info": None, "streak": None,
+        # Panel state for this record, surfaced so a GUI can SHOW it per row:
+        #   True  -> requested and composited onto the video,
+        #   False -> requested but dropped (Pillow missing / composite failed),
+        #   None  -> not requested (--panel off), or never got that far.
+        "panel_applied": None,
     }
     base.update(over)
     return base
@@ -609,7 +706,8 @@ def convert_one(rec_path, settings: ConvertSettings, log: Callable = print,
 
     rec_sha1_bytes = data                   # pre-patch bytes for the sidecar
     base = build_output_basename(info, rp.stem, ctx.rom_bytes,
-                                 plain=settings.plain_names, streak=streak)
+                                 plain=settings.plain_names, streak=streak,
+                                 pov=settings.pov)
     out_path = resolve_output_path(ctx.outdir, base, rp.name,
                                    ctx.used_out_paths)
     writer = None
@@ -638,6 +736,17 @@ def convert_one(rec_path, settings: ConvertSettings, log: Callable = print,
                 if changes:
                     log("  override: " + ", ".join(changes))
                 data = patched
+        # Opponent-POV flip: applied AFTER any presentation patch so the two
+        # transforms compose (each recomputes the checksum; to_opponent_pov
+        # runs last, so the final checksum is correct). Experimental —
+        # faithful only for genuine link records (see rec.to_opponent_pov).
+        if settings.pov == "opponent":
+            data = rec.to_opponent_pov(data)
+            faithful = pov_faithful(info)
+            log("  opponent POV (experimental): "
+                + ("faithful (genuine link record)" if faithful
+                   else "WHAT-IF — vs-AI Frontier record; the replay "
+                        "diverges after ~turn 1 and may end early"))
         injected = rec.inject(data, ctx.sav_bytes)
 
         writer_kwargs = dict(ctx.writer_kwargs)
@@ -668,18 +777,30 @@ def convert_one(rec_path, settings: ConvertSettings, log: Callable = print,
             f"outcome: {result.outcome_text}")
 
         # --- side panel: composite at finalize (outcome/duration known) -
+        # panel_applied: None = not requested; True/False = requested and
+        # (composited / dropped). A GUI reads this to SHOW 'panel on/off'
+        # per row so a silent drop can never masquerade as a full render.
+        panel_applied = None
+        if settings.panel != "off":
+            panel_applied = False
         if ctx.panel_enabled:
             try:
                 png = _render_panel_png(info, settings, ctx, result,
                                         streak, export_info)
                 _composite_panel(str(final_path), png, settings.panel,
                                  ctx.video_mod)
+                panel_applied = True
                 log(f"panel: {settings.panel} side info panel composited "
                     f"({settings.scale * PANEL_WIDTH_UNITS}x"
                     f"{settings.scale * PANEL_HEIGHT_UNITS})")
             except Exception as exc:
                 err(f"panel failed ({type(exc).__name__}: {exc}) — "
                     "video kept without the panel")
+        elif settings.panel != "off":
+            # requested but load_context already disabled it (Pillow missing);
+            # say so per-record too, not just once at batch preflight.
+            err(f"panel: {settings.panel} requested but not applied — "
+                + pillow_hint())
 
         sidecar_path = None
         if settings.sidecar:
@@ -687,16 +808,22 @@ def convert_one(rec_path, settings: ConvertSettings, log: Callable = print,
                        "text_speed": settings.text_speed,
                        "scale": settings.scale,
                        "audio": settings.audio,
-                       "pix_fmt": settings.pix_fmt}
+                       "pix_fmt": settings.pix_fmt,
+                       "pov": settings.pov}
             if settings.panel != "off":
                 options["panel"] = (settings.panel if ctx.panel_enabled
                                     else "off (Pillow missing)")
+            pov_meta = None
+            if settings.pov == "opponent":
+                pov_meta = {"pov": "opponent",
+                            "pov_faithful": pov_faithful(info),
+                            "pov_note": pov_note(info)}
             sidecar = build_sidecar(
                 source_rec_name=rp.name, rec_bytes=rec_sha1_bytes,
                 info=info, rom_crc32=ctx.rom_crc32,
                 options=options, result=result,
                 output_name=Path(final_path).name,
-                streak=streak, export_info=export_info)
+                streak=streak, export_info=export_info, pov_meta=pov_meta)
             sidecar_path = Path(final_path).with_suffix(".json")
             sidecar_path.write_text(json.dumps(sidecar, indent=2) + "\n",
                                     encoding="utf-8")
@@ -707,7 +834,7 @@ def convert_one(rec_path, settings: ConvertSettings, log: Callable = print,
                       frames=result.frames, seconds=result.seconds,
                       end_reason=result.end_reason,
                       outcome_text=result.outcome_text,
-                      info=info, streak=streak)
+                      info=info, streak=streak, panel_applied=panel_applied)
         if result.end_reason == "natural":
             log(f"wrote {final_path}")
             return _result(name, "OK",

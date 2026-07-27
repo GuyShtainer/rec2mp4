@@ -37,8 +37,9 @@ from pathlib import Path
 
 from . import rec
 from .pipeline import (
-    DEFAULT_OUTDIR, DEFAULT_ROM, DEFAULT_SAV,
+    CONDA_PYTHON, DEFAULT_OUTDIR, DEFAULT_ROM, DEFAULT_SAV,
     ConvertSettings, PipelineError, convert_one, load_context,
+    pillow_available, pillow_hint, stack_status,
 )
 from .panel import PANEL_SECTIONS
 
@@ -211,6 +212,7 @@ def default_form() -> dict:
         "sidecar": True,
         "panel": "right",
         "panel_sections": list(PANEL_SECTIONS),
+        "pov": "player",
     }
 
 
@@ -239,6 +241,10 @@ def settings_from_form(form: dict) -> ConvertSettings:
     panel_info = ("all" if set(sections) == set(PANEL_SECTIONS)
                   else ",".join(sections)) or "all"
 
+    pov = form.get("pov", "player")
+    if pov not in ("player", "opponent"):
+        pov = "player"
+
     return ConvertSettings(
         rom=form.get("rom") or None,
         sav=form.get("sav") or None,
@@ -251,11 +257,18 @@ def settings_from_form(form: dict) -> ConvertSettings:
         sidecar=bool(form.get("sidecar", True)),
         panel=panel,
         panel_info=panel_info,
+        pov=pov,
     )
 
 
 def format_result_status(result: dict) -> tuple[str, str]:
-    """(status, short detail) for a convert_one() result row."""
+    """(status, short detail) for a convert_one() result row.
+
+    When the result carries the pipeline's `panel_applied` flag (True/False;
+    None = panel not requested) a '[panel on]'/'[panel off]' tag is appended
+    so the user can SEE whether the side panel actually made it onto the
+    video — a silently-dropped panel is otherwise invisible in the row.
+    """
     status = result.get("status", ST_FAILED)
     if status == "OK" or status == "TRUNC":
         out = result.get("output")
@@ -265,9 +278,54 @@ def format_result_status(result: dict) -> tuple[str, str]:
             detail += f" ({result.get('end_reason', 'truncated')}, partial)"
         if out:
             detail += f" -> {Path(out).name}"
+        pa = result.get("panel_applied")
+        if pa is not None:
+            detail += "  [panel on]" if pa else "  [panel off]"
         return status, detail
     # INVALID / FAILED: the pipeline's one-line detail says it best.
     return status, str(result.get("detail") or result.get("error") or "")
+
+
+def panel_precheck(settings: ConvertSettings) -> str | None:
+    """Warning text when a conversion would SILENTLY lose its panel.
+
+    Returns an actionable message (naming this interpreter + how to fix it)
+    when `settings` asks for a side panel but Pillow is missing in the Python
+    running the GUI; None when the panel is off or Pillow is present. Pure
+    logic — the GUI shows the result in a red status line + a dialog, and
+    tests exercise it headless.
+    """
+    if settings.panel in ("right", "left") and not pillow_available():
+        return "info panel requested but unavailable — " + pillow_hint()
+    return None
+
+
+def launch_hint(status: dict) -> str | None:
+    """stderr/dialog message when THIS interpreter can't do a full conversion.
+
+    `status` is a pipeline.stack_status() dict. Returns None when the stack is
+    complete; otherwise a message that lists what is missing and gives the
+    exact rec2mp4-conda-env command to relaunch the GUI where it all works.
+    """
+    missing = []
+    if not status.get("emulator"):
+        missing.append("the mGBA emulator bindings")
+    if not status.get("ffmpeg"):
+        missing.append("ffmpeg")
+    if not status.get("pillow"):
+        missing.append("Pillow (the info panel)")
+    if not missing:
+        return None
+    return ("This Python ({py}) is missing {what}.\n"
+            "Conversions here will {fail}. Launch the GUI with the rec2mp4 "
+            "conda env, where the whole stack is installed:\n"
+            "  {conda} -m rec2mp4.gui".format(
+                py=status.get("interpreter") or "the current interpreter",
+                what=", ".join(missing),
+                fail=("fail outright" if not status.get("emulator")
+                      or not status.get("ffmpeg")
+                      else "drop the info panel"),
+                conda=CONDA_PYTHON))
 
 
 def open_in_file_manager(path) -> None:
@@ -305,10 +363,17 @@ class GuiApp:
         self._msgq: queue.Queue = queue.Queue()
         self._worker: threading.Thread | None = None
         self._cancel = threading.Event()
+        self._batch_warnings: list[str] = []
 
         self._build_queue_pane()
         self._build_settings_pane()
+        self._build_status_bar()
         self._build_action_bar()
+        # Re-evaluate the panel/Pillow warning whenever the panel choice
+        # changes, and probe the stack loudly at startup.
+        self.var_panel.trace_add("write",
+                                 lambda *_: self._refresh_stack_warning())
+        self._probe_stack_at_startup()
         self._poll()
 
     # ---- layout ---------------------------------------------------------
@@ -360,6 +425,7 @@ class GuiApp:
         self.var_rom = tk.StringVar(value=d["rom"])
         self.var_sav = tk.StringVar(value=d["sav"])
         self.var_outdir = tk.StringVar(value=d["outdir"])
+        self.var_pov = tk.StringVar(value=d["pov"])
         self.var_sections = {s: tk.BooleanVar(value=True)
                              for s in PANEL_SECTIONS}
 
@@ -394,6 +460,18 @@ class GuiApp:
         for s in PANEL_SECTIONS:
             ttk.Checkbutton(row2, text=s, variable=self.var_sections[s]
                             ).pack(side="left", padx=(0, 4))
+
+        row_pov = ttk.Frame(f)
+        row_pov.pack(fill="x", pady=2)
+        ttk.Label(row_pov, text="Camera:").pack(side="left")
+        ttk.Radiobutton(row_pov, text="Player side", value="player",
+                        variable=self.var_pov).pack(side="left", padx=(2, 6))
+        ttk.Radiobutton(row_pov, text="Opponent side", value="opponent",
+                        variable=self.var_pov).pack(side="left", padx=(0, 8))
+        ttk.Label(row_pov,
+                  text="(opponent side is experimental — a 'what-if' for "
+                       "Frontier battles; may end early)",
+                  foreground="#8a6d00").pack(side="left")
 
         for label, var, patt in (
                 ("ROM:", self.var_rom, [("GBA ROM", "*.gba"),
@@ -431,6 +509,65 @@ class GuiApp:
         self.progress = ttk.Label(bar, text="idle", anchor="w")
         self.progress.pack(side="left", fill="x", expand=True, padx=8)
 
+    def _build_status_bar(self):
+        """A red, wrapping warning line above the action bar. Empty = hidden.
+
+        Plain tk.Label (not ttk) so a red foreground works without a custom
+        ttk style; wraplength lets the multi-line install/relaunch hints show
+        in full instead of being clipped to one row."""
+        frame = ttk.Frame(self.root, padding=(8, 0, 8, 0))
+        frame.pack(side="bottom", fill="x")
+        self.warn_label = tk.Label(frame, text="", anchor="w",
+                                   justify="left", fg="#b00020",
+                                   wraplength=860)
+        self.warn_label.pack(side="left", fill="x", expand=True)
+        # keep the wrap width in step with the window so nothing is clipped
+        frame.bind("<Configure>",
+                   lambda e: self.warn_label.configure(
+                       wraplength=max(200, e.width - 16)))
+
+    def _set_warning(self, text: str) -> None:
+        """Show (red) or clear the warning line. Also mirrored to stderr so a
+        terminal-launched GUI logs it too."""
+        text = (text or "").strip()
+        self.warn_label.configure(text=("⚠ " + text) if text else "")
+        if text:
+            print("rec2mp4 GUI: " + text.replace("\n", " "), file=sys.stderr)
+
+    def _refresh_stack_warning(self) -> dict:
+        """Probe this interpreter and surface any missing-stack warning.
+
+        Emulator/ffmpeg missing => conversions fail (loud, always shown);
+        Pillow missing + panel requested => the panel would be dropped. The
+        message names THIS interpreter and the exact conda relaunch command."""
+        st = stack_status()
+        msgs = []
+        hint = launch_hint(st)
+        try:
+            panel_on = self.var_panel.get() in ("right", "left")
+        except Exception:
+            panel_on = True
+        # Only nag about Pillow when the panel is actually requested.
+        if st.get("emulator") and st.get("ffmpeg") and st.get("pillow"):
+            hint = None
+        elif st.get("emulator") and st.get("ffmpeg") and not panel_on:
+            hint = None                     # only Pillow missing, panel off
+        if hint:
+            msgs.append(hint)
+        self._set_warning("\n".join(msgs))
+        return st
+
+    def _probe_stack_at_startup(self) -> None:
+        """Loud, un-missable check when the GUI opens in a Python that cannot
+        do a full conversion: a red status line always, plus a modal dialog
+        when the emulator/ffmpeg (i.e. any video at all) is missing."""
+        st = self._refresh_stack_warning()
+        if not (st.get("emulator") and st.get("ffmpeg")):
+            hint = launch_hint(st)
+            if hint:
+                messagebox.showwarning(
+                    "rec2mp4 — conversions unavailable here", hint)
+
     # ---- form <-> settings ----------------------------------------------
 
     def read_form(self) -> dict:
@@ -447,6 +584,7 @@ class GuiApp:
             "panel": self.var_panel.get(),
             "panel_sections": [s for s in PANEL_SECTIONS
                                if self.var_sections[s].get()],
+            "pov": self.var_pov.get(),
         }
 
     def read_settings(self) -> ConvertSettings:
@@ -551,6 +689,18 @@ class GuiApp:
         except (ValueError, tk.TclError) as exc:
             messagebox.showerror("rec2mp4", f"Bad settings: {exc}")
             return
+        # Never let a requested panel silently vanish: if Pillow is missing in
+        # this Python, say so BEFORE converting and let the user decide.
+        warn = panel_precheck(settings)
+        if warn:
+            self._set_warning(warn)
+            if not messagebox.askyesno(
+                    "rec2mp4 — info panel unavailable",
+                    warn + "\n\nConvert anyway? The video(s) will be produced "
+                    "WITHOUT the info panel."):
+                self.progress.configure(text="cancelled — panel unavailable")
+                return
+        self._batch_warnings.clear()
         for i in jobs:
             self.model.items[i].status = ST_WAITING
             self.model.items[i].detail = ""
@@ -640,7 +790,15 @@ class GuiApp:
                 self.progress.configure(
                     text=f"{self.model.items[idx].path.name}: {first}")
         elif kind == "blog":                       # batch-level log line
-            self.progress.configure(text=str(msg[1]).splitlines()[0])
+            text = str(msg[1])
+            # err() prefixes batch warnings with "! " (see _worker_main):
+            # surface those in the red warning line, not just the (scrolling)
+            # progress label, so a Pillow-missing degrade can't hide.
+            if text.startswith("! "):
+                warn = text[2:]
+                self._batch_warnings.append(warn)
+                self._set_warning(warn)
+            self.progress.configure(text=text.lstrip("! ").splitlines()[0])
         elif kind == "progress":
             _, idx, p = msg
             self.progress.configure(
@@ -703,6 +861,12 @@ def main(argv=None) -> int:                            # noqa: ARG001
               "the Tk support package for your Python (python.org and "
               "conda installers include it).", file=sys.stderr)
         return 2
+    # Detect a launch under the wrong interpreter (no mGBA / ffmpeg / Pillow)
+    # and print the exact conda-env relaunch command to the terminal. The GUI
+    # itself repeats this in a red status line + dialog once it is up.
+    hint = launch_hint(stack_status())
+    if hint:
+        print("rec2mp4: " + hint, file=sys.stderr)
     try:
         root = tk.Tk()
     except tk.TclError as exc:

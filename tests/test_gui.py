@@ -225,7 +225,47 @@ def test_status_formatting():
     st, det = gui.format_result_status(
         {"status": "FAILED", "detail": "", "error": "boom"})
     ok(st == "FAILED" and det == "boom", f"FAILED row: {det!r}")
-    print("   OK/TRUNC/INVALID/FAILED rows")
+    # panel_applied surfaces per row: True -> [panel on], False -> [panel off],
+    # None / absent -> nothing (panel not requested, or pre-panel result).
+    st, det = gui.format_result_status(
+        {"status": "OK", "output": "/x/y.mp4", "frames": 10, "seconds": 1.0,
+         "end_reason": "natural", "panel_applied": True})
+    ok(det.endswith("[panel on]"), f"panel-on tag missing: {det!r}")
+    st, det = gui.format_result_status(
+        {"status": "OK", "output": "/x/y.mp4", "frames": 10, "seconds": 1.0,
+         "end_reason": "natural", "panel_applied": False})
+    ok(det.endswith("[panel off]"), f"panel-off tag missing: {det!r}")
+    st, det = gui.format_result_status(
+        {"status": "OK", "output": "/x/y.mp4", "frames": 10, "seconds": 1.0,
+         "end_reason": "natural", "panel_applied": None})
+    ok("panel" not in det, f"None panel must add no tag: {det!r}")
+    print("   OK/TRUNC/INVALID/FAILED rows + panel on/off tag")
+
+
+def test_panel_precheck():
+    print("-- panel_precheck() + launch_hint()")
+    from rec2mp4.pipeline import pillow_available
+    s_on = gui.settings_from_form(gui.default_form())          # panel right
+    warn = gui.panel_precheck(s_on)
+    if pillow_available():
+        ok(warn is None, f"Pillow present: precheck must be None, got {warn!r}")
+    else:
+        ok(warn and "Pillow" in warn and "-m rec2mp4.gui" in warn,
+           f"Pillow missing: precheck must name the fix, got {warn!r}")
+    # panel off -> never a precheck warning, regardless of Pillow
+    form = gui.default_form(); form["panel"] = "off"
+    ok(gui.panel_precheck(gui.settings_from_form(form)) is None,
+       "panel off must never precheck-warn")
+    # launch_hint: complete stack -> None; each gap -> named + conda command
+    ok(gui.launch_hint({"emulator": True, "ffmpeg": True, "pillow": True,
+                        "interpreter": "/x"}) is None,
+       "complete stack must give no launch hint")
+    h = gui.launch_hint({"emulator": False, "ffmpeg": False, "pillow": False,
+                         "interpreter": "/x/py"})
+    ok(h and "/x/py" in h and "rec2mp4.gui" in h and "mGBA" in h,
+       f"launch hint must name interpreter + conda command: {h!r}")
+    print("   precheck honors Pillow presence + panel choice; launch_hint "
+          "names the fix")
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +307,7 @@ def main():
     test_queue_model()
     test_row_formatting()
     test_status_formatting()
+    test_panel_precheck()
     test_widget_smoke()
     if _checks == 0:
         print("VACUOUS RUN: zero checks executed")

@@ -359,6 +359,17 @@ def test_pipeline_no_emulator():
        and s.text_speed == "record" and s.pix_fmt == "rgb0",
        "ConvertSettings defaults wrong")
 
+    # stack probes: pillow_available agrees with a real import; stack_status
+    # reports the keys front-ends rely on; pillow_hint names the conda env.
+    ok(pipeline.pillow_available() == _pil_available(),
+       "pillow_available() disagrees with a direct import")
+    st = pipeline.stack_status()
+    for key in ("pillow", "emulator", "ffmpeg", "ok", "interpreter"):
+        ok(key in st, f"stack_status missing {key!r}: {st}")
+    ok(st["pillow"] == _pil_available(), "stack_status pillow flag wrong")
+    ok("miniconda3/envs/rec2mp4" in pipeline.pillow_hint(),
+       "pillow_hint must name the rec2mp4 conda env")
+
     tmp = Path(tempfile.mkdtemp(prefix="rec2mp4-pipe-"))
     logs, errs = [], []
     try:
@@ -371,6 +382,10 @@ def test_pipeline_no_emulator():
         ok("wrong size" in res["detail"], f"detail: {res['detail']!r}")
         ok(res["output"] is None and res["frames"] == 0,
            "INVALID must produce no output")
+        # panel_applied is part of the result contract; None until a video is
+        # actually composited (INVALID never gets that far).
+        ok("panel_applied" in res and res["panel_applied"] is None,
+           f"panel_applied must default None: {res.get('panel_applied')!r}")
         ok(logs and logs[0] == "invalid record — skipping:",
            f"log lines wrong: {logs[:2]}")
         ok(not errs, f"INVALID must not write to err: {errs}")
