@@ -97,6 +97,15 @@ SPECIES_NAME_LEN = 11              # POKEMON_NAME_LENGTH + 1 (global.h:95)
 SPECIES_NAMES_COUNT = 412          # rows 0..411, species_names.h (no EGG row)
 SPECIES_EGG = 412                  # constants/species.h:418 (= NUM_SPECIES)
 
+# Move names (used by the side panel's per-mon move list).
+#   extern const u8 gMoveNames[MOVES_COUNT][MOVE_NAME_LENGTH + 1]  data.h
+#   MOVE_NAME_LENGTH = 12          // include/constants/pokemon.h
+#   MOVES_COUNT = 355              // include/constants/moves.h
+#   gMoveNames @ 0x0831977C        // pokeemerald.sym; size 0x1207 = 355 * 13
+GMOVE_NAMES_ADDR = 0x0831977C
+MOVE_NAME_LEN = 13                 # MOVE_NAME_LENGTH + 1
+MOVES_COUNT = 355                  # rows 0..354 (0 = MOVE_NONE, no real name)
+
 # ---------------------------------------------------------------------------
 # Strict Gen-3 charset decode (same table style as rec.py's _g3chr, but any
 # byte OUTSIDE the table aborts the decode -> None, instead of yielding '?').
@@ -201,6 +210,62 @@ def frontier_trainer_name(rom_bytes: bytes, trainer_id: int) -> str | None:
     if not class_name or not name:
         return None
     return f"{class_name} {name}"
+
+
+def frontier_trainer_rawname(rom_bytes, trainer_id: int) -> str | None:
+    """The plain trainer NAME field (no class prefix) of a ROM frontier
+    trainer — e.g. 'NORTON', up to 7 Gen-3 chars so it fits a trainer name
+    slot. This is gBattleFrontierTrainers[id].trainerName by itself; the
+    '<CLASS> <NAME>' display string is frontier_trainer_name().
+
+    Same address/stride/plausibility gate as frontier_trainer_name (the
+    monSet ROM-pointer check proves the entry is real). Returns None on any
+    doubt: id out of range, ROM too small / not US Emerald, implausible
+    struct contents, undecodable name bytes.
+    """
+    if not isinstance(rom_bytes, (bytes, bytearray, memoryview)):
+        return None
+    rom = bytes(rom_bytes) if not isinstance(rom_bytes, bytes) else rom_bytes
+    if not isinstance(trainer_id, int) or isinstance(trainer_id, bool) or not (
+            0 <= trainer_id < FRONTIER_TRAINERS_COUNT):
+        return None
+
+    entry = _rom_slice(rom,
+                       GBATTLE_FRONTIER_TRAINERS_ADDR
+                       + trainer_id * BFT_ENTRY_SIZE,
+                       BFT_ENTRY_SIZE)
+    if entry is None:
+        return None
+
+    # Plausibility: monSet must be a ROM pointer (0x08/0x09 cart bus).
+    mon_set = int.from_bytes(entry[BFT_MONSET_OFFSET:BFT_MONSET_OFFSET + 4],
+                             "little")
+    if not (0x08000000 <= mon_set < 0x0A000000):
+        return None
+
+    return _g3str_strict(entry[BFT_NAME_OFFSET:BFT_NAME_OFFSET + BFT_NAME_LEN])
+
+
+def move_name(rom_bytes, move_id: int) -> str | None:
+    """Move name for a Gen-3 move id, read from the user's own ROM
+    (gMoveNames). id 0 (MOVE_NONE) -> None; valid ids run 1..354. Decoded
+    with the same strict Gen-3 charset as species_name; None on ANY doubt
+    (id out of range, ROM too small / not US Emerald, undecodable bytes).
+    """
+    if not isinstance(rom_bytes, (bytes, bytearray, memoryview)):
+        return None
+    rom = bytes(rom_bytes) if not isinstance(rom_bytes, bytes) else rom_bytes
+    if not isinstance(move_id, int) or isinstance(move_id, bool):
+        return None
+    if move_id == 0:                        # MOVE_NONE has no real name
+        return None
+    if not (0 < move_id < MOVES_COUNT):
+        return None
+    raw = _rom_slice(rom, GMOVE_NAMES_ADDR + move_id * MOVE_NAME_LEN,
+                     MOVE_NAME_LEN)
+    if raw is None:
+        return None
+    return _g3str_strict(raw)
 
 
 def species_name(rom_bytes, internal_id: int) -> str | None:

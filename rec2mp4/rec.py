@@ -144,6 +144,26 @@ _ORDERS = ["GAEM", "GAME", "GEAM", "GEMA", "GMAE", "GMEA", "AGEM", "AGME",
            "AEGM", "AEMG", "AMGE", "AMEG", "EGAM", "EGMA", "EAGM", "EAMG",
            "EMGA", "EMAG", "MGAE", "MGEA", "MAGE", "MAEG", "MEGA", "MEAG"]
 
+# Generic-English nature names in canonical Gen-3 index order (Hardy..Quirky).
+# id = personality % 25 (src/pokemon.c GetNatureFromPersonality). These are the
+# universal English labels, not Game Freak data lifted from the ROM.
+NATURES = [
+    "Hardy", "Lonely", "Brave", "Adamant", "Naughty",
+    "Bold", "Docile", "Relaxed", "Impish", "Lax",
+    "Timid", "Hasty", "Serious", "Jolly", "Naive",
+    "Modest", "Mild", "Quiet", "Bashful", "Rash",
+    "Calm", "Gentle", "Sassy", "Careful", "Quirky",
+]
+
+# Canonical stat-key order used across decode + panel. Note this is the
+# DISPLAY order (HP, Atk, Def, SpA, SpD, Spe) — NOT the on-cart EV/IV byte
+# order, which stores Speed before the special stats (see _decode_mon).
+STAT_KEYS = ("hp", "atk", "def", "spa", "spd", "spe")
+STAT_LABELS = {"hp": "HP", "atk": "Atk", "def": "Def",
+               "spa": "SpA", "spd": "SpD", "spe": "Spe"}
+
+MAX_MON_MOVES = 4                    # include/constants/pokemon.h
+
 
 def _decode_mon(m: bytes) -> dict | None:
     """m = one 100-byte party mon -> dict, or None if the slot is empty."""
@@ -154,11 +174,12 @@ def _decode_mon(m: bytes) -> dict | None:
     words = struct.unpack_from("<12I", m, 32)
     dec = struct.pack("<12I", *(w ^ key for w in words))
     ck = sum(struct.unpack("<24H", dec)) & 0xFFFF
-    g = _ORDERS[pers % 24].index('G') * 12
+    order = _ORDERS[pers % 24]
+    g = order.index('G') * 12
     species = struct.unpack_from("<H", dec, g)[0]
     if species == 0:
         return None
-    return {
+    out = {
         "nickname": _g3str(m[8:18]),
         "species_internal": species,       # internal Gen-3 id (1..411, 412=Egg)
         "level": m[84],                    # plaintext, party-mon offset +84
@@ -166,6 +187,50 @@ def _decode_mon(m: bytes) -> dict | None:
                   ^ (pers >> 16) ^ (pers & 0xFFFF)) < 8,
         "checksum_ok": ck == struct.unpack_from("<H", m, 28)[0],
     }
+    # Only when the decrypted region's checksum matches do the substruct
+    # fields carry meaning; on a mismatch the caller must NOT trust them, so
+    # the moves/EV/IV/nature keys are omitted entirely (their presence is the
+    # signal that decode succeeded).
+    if out["checksum_ok"]:
+        a = order.index('A') * 12          # Attacks substruct (Substruct1)
+        e = order.index('E') * 12          # EVs substruct (Substruct2)
+        mi = order.index('M') * 12         # Misc substruct (Substruct3)
+
+        # Substruct1 (pokemon.h:109-113): u16 moves[4] then u8 pp[4].
+        move_ids = struct.unpack_from("<4H", dec, a)
+        pp = dec[a + 8:a + 12]
+        out["moves"] = [{"id": mid, "pp": pp[i]}
+                        for i, mid in enumerate(move_ids) if mid != 0]
+
+        # Substruct2 (pokemon.h:115-129): EVs in on-cart order
+        # hp, attack, defense, SPEED, spAttack, spDefense (Speed BEFORE the
+        # special stats — the classic silent bug is mapping it into spa).
+        ev_hp, ev_atk, ev_def, ev_spe, ev_spa, ev_spd = dec[e:e + 6]
+        out["evs"] = {
+            "hp": ev_hp, "atk": ev_atk, "def": ev_def,
+            "spa": ev_spa, "spd": ev_spd, "spe": ev_spe,
+            "sum": ev_hp + ev_atk + ev_def + ev_spa + ev_spd + ev_spe,
+        }
+
+        # Substruct3 (pokemon.h:141-146): a u32 at substruct offset +4 packing
+        # (LSB-first) hpIV:5, attackIV:5, defenseIV:5, speedIV:5, spAttackIV:5,
+        # spDefenseIV:5, isEgg:1, abilityNum:1. Speed is again BEFORE special.
+        iv = struct.unpack_from("<I", dec, mi + 4)[0]
+        iv_hp = iv & 0x1F
+        iv_atk = (iv >> 5) & 0x1F
+        iv_def = (iv >> 10) & 0x1F
+        iv_spe = (iv >> 15) & 0x1F
+        iv_spa = (iv >> 20) & 0x1F
+        iv_spd = (iv >> 25) & 0x1F
+        out["ivs"] = {
+            "hp": iv_hp, "atk": iv_atk, "def": iv_def,
+            "spa": iv_spa, "spd": iv_spd, "spe": iv_spe,
+            "sum": iv_hp + iv_atk + iv_def + iv_spa + iv_spd + iv_spe,
+        }
+
+        nat = pers % 25
+        out["nature"] = {"id": nat, "name": NATURES[nat]}
+    return out
 
 
 def _classify_opponent(opp_id: int, r: bytes) -> tuple[str, str]:
@@ -388,7 +453,7 @@ _POV_FAKE_NAME = "FOE"
 _POV_FAKE_TRAINER_ID = 0x00003F3F        # any nonzero (low 16 = visible ID)
 
 
-def to_opponent_pov(rec: bytes) -> bytes:
+def to_opponent_pov(rec: bytes, bottom_trainer_name: str | None = None) -> bytes:
     """Transform a record so playback renders from the OPPONENT's side.
 
     Implements the "fake link record" (H2) transform from
@@ -468,9 +533,16 @@ def to_opponent_pov(rec: bytes) -> bytes:
     # 3. Fabricate link-player slot 1 (the trainer now at the bottom) — only
     #    for a fake-link record. A genuine link record keeps its real
     #    opponent name/id/language so the faithful view labels the real
-    #    trainer, not "FOE".
+    #    trainer. For a fake-link record we now write the REAL opponent's
+    #    on-screen NAME (up to 7 Gen-3 chars) when the caller supplies it,
+    #    instead of the generic "FOE" — the user saw a real NPC's name
+    #    replaced by a placeholder. NOTE: only the on-screen NAME is
+    #    corrected; the link character SPRITE stays a generic player
+    #    character — the link-replay path cannot draw the frontier trainer's
+    #    class art at the bottom (engine limitation, see opponent-pov.md §1.4).
     if not genuine_link:
-        out[base + 1208:base + 1216] = _g3encode(_POV_FAKE_NAME, 8)
+        name = bottom_trainer_name if bottom_trainer_name else _POV_FAKE_NAME
+        out[base + 1208:base + 1216] = _g3encode(name, 8)
         out[base + 1233] = 0                                   # gender male
         out[base + 1240:base + 1244] = \
             _POV_FAKE_TRAINER_ID.to_bytes(4, "little")
