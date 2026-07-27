@@ -47,6 +47,10 @@ jobs:
         run: python tests/test_rec.py
       - name: naming / romdata / sidecar suite (asset-free sections)
         run: python tests/test_naming.py
+      - name: panel / species / streak-stem / pipeline suite
+        run: python tests/test_panel.py
+      - name: GUI pure-logic suite (widget smoke skips headless)
+        run: python tests/test_gui.py
 
   encoder:
     name: encoder self-test (${{ matrix.os }})

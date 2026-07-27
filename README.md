@@ -30,10 +30,16 @@ Detail of what that covers:
 - **Parser / validator / injector (`rec2mp4.rec`)** — verified against the 10
   real records, plus corruption tests (checksum, sentinel, forbidden
   battle-flag bits, truncation) and an inject round-trip. Pure stdlib, tested
-  on Python 3.12–3.14 (110 checks passing; 54 in the asset-free synthetic
+  on Python 3.12–3.14 (118 checks passing; 54 in the asset-free synthetic
   mode CI runs).
 - **`--info-only` CLI** — summarizes records with no emulator, ffmpeg, ROM or
   save needed.
+- **Battle-info side panel** — since the refactor into `rec2mp4.pipeline`
+  (the conversion engine the CLI wraps), each video gets a text-only info
+  panel (teams with species names read from your ROM, opponents, streak,
+  outcome/duration) composited beside the battle; verified end-to-end on a
+  real record (panel + undistorted 960×640 game + intact audio). See "The
+  battle-info side panel" below.
 - **Emulator driver + encoder (`rec2mp4.driver` / `rec2mp4.video`)** — the full
   boot → menu-drive → inject → replay → end-detect → encode chain is what the
   batch above exercised. One real-world fix over the researched plan: the
@@ -147,15 +153,62 @@ python3 -m rec2mp4 my.rec --no-audio --scale 2 --sav local/alt-saves/all-shiny.s
 
 # Exactly as the recorder saw it (their BATTLE SCENE / text-speed settings)
 python3 -m rec2mp4 my.rec --anims record --text-speed record
+
+# No side panel (plain game video, exactly the pre-panel output)
+python3 -m rec2mp4 my.rec --panel off
 ```
 
 Options: `-o/--outdir` (default `out/`), `--rom` (default `local/rom.gba`),
 `--sav` (default `local/template.sav`), `--headed`, `--scale N`, `--no-audio`,
 `--anims on|off|record` (default `on`), `--text-speed slow|mid|fast|record`
-(default `record`), `--plain-names`, `--no-sidecar`, `--info-only`,
+(default `record`), `--panel right|left|off` (default `right`),
+`--panel-info CSV` (default `all` — see "The battle-info side panel"),
+`--plain-names`, `--no-sidecar`, `--info-only`,
 `--max-seconds N` (replay timeout, default 1800), `--pix-fmt`
 (raw-framebuffer format handed to ffmpeg, default `rgb0`).
 Exit code is non-zero if any record fails.
+
+### The battle-info side panel (`--panel`, `--panel-info`)
+
+By default every video gets a dark, text-only info panel composited beside
+the battle (`--panel right`; `left` swaps sides, `off` produces the plain
+game video byte-for-byte as before). The panel is half the game's width at
+the same height (480×640 next to the default 960×640 game), so the default
+output is 1440×640. The game capture itself is untouched — the panel is
+stacked on at finalize time with ffmpeg `hstack` (video re-encoded once,
+audio stream-copied, `+faststart`, atomic replace), which is also why the
+panel can show the **outcome and duration**: they are known by then.
+
+What it shows (pick sections with `--panel-info header,teams,...`; default
+`all`): facility + level mode + battle kind (`header`), streak when known,
+recorder and co-players (`players`), opponent display names (`opponents`),
+both teams with **species names read from YOUR ROM** (`gSpeciesNames` at a
+known US-Emerald address — internal-id order, no name tables ship with the
+tool), nickname shown only when it differs from the species, level and a
+gold `*` for shinies (`teams`), the first lines of a PokeDNA `.txt` export
+sidecar (`export`), and outcome/duration/RNG seed (`footer`). Text only —
+no Game Freak artwork, and every game-derived string comes from your own
+ROM or record at runtime.
+
+The panel needs Pillow (`pip install pillow` into whatever Python runs
+rec2mp4 — the conda env from Setup already has it). Without Pillow the
+conversion still works: a warning is printed and videos are written
+without the panel. `--panel off` never touches Pillow.
+
+### Streak-aware export filenames (PokeDNA)
+
+PokeDNA's upcoming export format names records
+`<PLAYER>_<Facility>-<O|50>-<streak>_<date>_<time>.rec`
+(e.g. `GUYA_Factory-50-7_27-07-2026_10-40.rec`, `O` = Open Level). rec2mp4
+recognizes that stem: the streak lands in the output filename
+(`... vs SAILOR MAXWELL (streak 7).mp4`), in the panel header
+(`Streak 7`) and in the JSON sidecar (`"streak": 7`). The stem is checked
+against the record itself; on a mismatch a warning is printed and the
+record is trusted. Old-format stems (`GUYA_27-07-2026_10-40.rec`) behave
+exactly as before. If a `<same stem>.txt` info file sits next to the
+`.rec` (PokeDNA's future export sidecar), its lines are stored in the JSON
+sidecar as `export_info` and the first few short lines are rendered in the
+panel's `export` section.
 
 ### Output names & the JSON sidecar
 
@@ -200,6 +253,45 @@ with different scene settings stay in sync — and recorded inputs are consumed
 per decision, not per frame. Verified empirically: the same record converted
 with animations off (59.4 s) and on (73.6 s) reaches the same outcome with
 identical HP trajectories.
+
+## GUI (desktop)
+
+A minimal desktop front-end over the exact same pipeline, built on stdlib
+`tkinter` — **zero extra dependencies** (python.org and conda installers on
+macOS/Windows ship Tk support):
+
+```bash
+python -m rec2mp4.gui        # from a clone
+rec2mp4-gui                  # if installed with pip (gui-script entry point)
+```
+
+What it does:
+
+* **Queue** — "Add .rec files…" (multi-select) or "Add folder…" (every
+  `*.rec`, sorted, like the CLI); each record is validated + summarized with
+  the pure-stdlib parser **the moment it is added** (no emulator involved),
+  so invalid records are flagged red immediately. Duplicates are skipped,
+  rows show facility / level mode / battle kind / opponent, and
+  double-clicking a row opens a details window with the full record summary
+  and, after a conversion, that record's complete log.
+* **Settings pane** — mirrors the CLI options 1:1 (animations, text speed,
+  scale, audio, side panel + per-section checkboxes, plain names, JSON
+  sidecar, output folder, ROM/save pickers prefilled with the `local/`
+  defaults when those files exist).
+* **Convert** — runs the batch on a worker thread; per-row status
+  (`waiting` / `converting` / `OK` / `TRUNC` / `FAILED`) plus a live
+  progress line fed by the driver's own log and frame counter. **Cancel**
+  finishes the record in flight, then stops. "Open output folder" opens
+  Finder/Explorer on the output directory.
+
+Converting still needs everything the CLI needs — the emulator stack from
+"Setup" (vendored mGBA bindings + ffmpeg) plus **your own** ROM and a
+post-game save; if the stack is missing, the GUI surfaces the same install
+hint the CLI prints. Queueing and inspecting records works with nothing
+installed at all. Honest status: the GUI is newly built and has been
+exercised on macOS only (the pure-logic layer is covered by
+`tests/test_gui.py` on all three CI OSes; the widget smoke test runs where
+a display exists). Screenshots are deliberately not included.
 
 ## Windows notes
 
