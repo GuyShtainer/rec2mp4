@@ -52,6 +52,25 @@ builds it from two lookups (the exact data flow rec2mp4 mirrors):
   gTrainerClassNames           @ 0x0830FCD4  // pokeemerald.sym; size 0x35A = 858
                                              //  = 66 classes * 13 bytes
 
+Species names (used by the side panel / team displays):
+
+  extern const u8 gSpeciesNames[][POKEMON_NAME_LENGTH + 1]  // include/data.h:139
+  POKEMON_NAME_LENGTH = 10                   // include/constants/global.h:95
+  gSpeciesNames @ 0x083185C8                 // pokeemerald.sym; size 0x11B4
+                                             //  = 4532 = 412 * 11 (confirms stride)
+
+  The table is indexed by INTERNAL species id and runs SPECIES_NONE (0) ..
+  SPECIES_CHIMECHO (411) — src/data/text/species_names.h (first entry
+  [SPECIES_NONE], last entry [SPECIES_CHIMECHO]). Internal order differs
+  from the National Dex: ids 252..276 are the SPECIES_OLD_UNOWN_* hole
+  (constants/species.h:256-281), whose name entries are placeholder "?"
+  glyphs, and Hoenn mons start at SPECIES_TREECKO = 277
+  (constants/species.h:283). SPECIES_EGG = 412 = NUM_SPECIES
+  (constants/species.h:418-420) has NO row in the table — GetSpeciesName
+  (src/pokemon.c:4618) only range-checks species > NUM_SPECIES, and the
+  game displays eggs through a separate path — so 412 is special-cased
+  here to the label "EGG" instead of reading past the table.
+
 Pure stdlib; returns None on ANY doubt rather than a wrong name.
 """
 
@@ -72,6 +91,11 @@ BFT_MONSET_OFFSET = 48             # const u16 *monSet
 FACILITY_CLASSES_COUNT = 82        # trainers.h:206 (0x52)
 TRAINER_CLASSES_COUNT = 66         # sym size 0x35A / 13
 TRAINER_CLASS_NAME_LEN = 13        # gTrainerClassNames[][13], data.h:138
+
+GSPECIES_NAMES_ADDR = 0x083185C8   # pokeemerald.sym; size 0x11B4 = 412 * 11
+SPECIES_NAME_LEN = 11              # POKEMON_NAME_LENGTH + 1 (global.h:95)
+SPECIES_NAMES_COUNT = 412          # rows 0..411, species_names.h (no EGG row)
+SPECIES_EGG = 412                  # constants/species.h:418 (= NUM_SPECIES)
 
 # ---------------------------------------------------------------------------
 # Strict Gen-3 charset decode (same table style as rec.py's _g3chr, but any
@@ -177,3 +201,30 @@ def frontier_trainer_name(rom_bytes: bytes, trainer_id: int) -> str | None:
     if not class_name or not name:
         return None
     return f"{class_name} {name}"
+
+
+def species_name(rom_bytes, internal_id: int) -> str | None:
+    """UPPERCASE species name for a Gen-3 INTERNAL species id, read from the
+    user's own ROM (gSpeciesNames, layout facts in the module docstring).
+
+    internal_id is the id stored in party mons (rec.py's species_internal):
+    1..411, where 252..276 is the OLD_UNOWN hole (the ROM's rows there are
+    placeholder '?' names, returned as-is — callers should treat an all-'?'
+    result as unknown) and 412 = EGG (no ROM row; returns the label 'EGG').
+    Returns None on any doubt: id out of range, ROM too small / not US
+    Emerald, undecodable name bytes.
+    """
+    if not isinstance(rom_bytes, (bytes, bytearray, memoryview)):
+        return None
+    rom = bytes(rom_bytes) if not isinstance(rom_bytes, bytes) else rom_bytes
+    if not isinstance(internal_id, int) or isinstance(internal_id, bool):
+        return None
+    if internal_id == SPECIES_EGG:
+        return "EGG"
+    if not (0 <= internal_id < SPECIES_NAMES_COUNT):
+        return None
+    raw = _rom_slice(rom, GSPECIES_NAMES_ADDR
+                     + internal_id * SPECIES_NAME_LEN, SPECIES_NAME_LEN)
+    if raw is None:
+        return None
+    return _g3str_strict(raw)
