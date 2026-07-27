@@ -12,5 +12,8 @@ requires-python = ">=3.10"
 [project.scripts]
 rec2mp4 = "rec2mp4.__main__:main"
 
+[project.gui-scripts]
+rec2mp4-gui = "rec2mp4.gui:main"
+
 [tool.setuptools.packages.find]
 include = ["rec2mp4*"]
