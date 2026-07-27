@@ -15,7 +15,12 @@
 #              exit 0); exit 2 would mean a vacuous run and fails the job.
 #              Plus the naming/sidecar suite (tests/test_naming.py), whose
 #              asset-free sections always run; its ROM ground-truth section
-#              skips cleanly with exit 0 when local/rom.gba is absent.
+#              skips cleanly with exit 0 when local/rom.gba is absent. And the
+#              party-mon decode suite (tests/test_decode.py): its asset-free
+#              guard for the speed<->spAttack EV/IV mapping, the 5-bit IV
+#              unpack, nature=%25 and the POV name injection runs in every
+#              asset-free run ("SYNTHETIC MODE", exit 0); the real-record/ROM
+#              cross-check runs only when local/ assets are present.
 #   encoder  — the real ffmpeg encode path: rec2mp4/video.py's self-test
 #              pipes synthetic frames + PCM through ffmpeg and verifies the
 #              result with ffprobe (codecs, geometry, duration, temp cleanup).
@@ -51,6 +56,8 @@ jobs:
         run: python tests/test_panel.py
       - name: opponent-POV transform / naming / sidecar suite (asset-free)
         run: python tests/test_pov.py
+      - name: party-mon decode suite — EV/IV speed<->spAttack guard (synthetic mode in CI)
+        run: python tests/test_decode.py
       - name: GUI pure-logic suite (widget smoke skips headless)
         run: python tests/test_gui.py
 

@@ -37,9 +37,11 @@ Detail of what that covers:
 - **Battle-info side panel** — since the refactor into `rec2mp4.pipeline`
   (the conversion engine the CLI wraps), each video gets a text-only info
   panel (teams with species names read from your ROM, opponents, streak,
-  outcome/duration) composited beside the battle; verified end-to-end on a
-  real record (panel + undistorted 960×640 game + intact audio). See "The
-  battle-info side panel" below.
+  each mon's moves/EVs/IVs with EV `/510` + IV `/186` sums, outcome/duration)
+  composited beside the battle — with an optional `--panel-cycle` that rotates
+  the moves/EV/IV pages over time; verified end-to-end on a real record (panel
+  + undistorted 960×640 game + intact audio). See "The battle-info side panel"
+  below.
 - **Emulator driver + encoder (`rec2mp4.driver` / `rec2mp4.video`)** — the full
   boot → menu-drive → inject → replay → end-detect → encode chain is what the
   batch above exercised. One real-world fix over the researched plan: the
@@ -186,10 +188,47 @@ recorder and co-players (`players`), opponent display names (`opponents`),
 both teams with **species names read from YOUR ROM** (`gSpeciesNames` at a
 known US-Emerald address — internal-id order, no name tables ship with the
 tool), nickname shown only when it differs from the species, level and a
-gold `*` for shinies (`teams`), the first lines of a PokeDNA `.txt` export
+gold `*` for shinies (`teams`), each mon's decoded battle stats (`moves`,
+`evs`, `ivs` — see below), the first lines of a PokeDNA `.txt` export
 sidecar (`export`), and outcome/duration/RNG seed (`footer`). Text only —
 no Game Freak artwork, and every game-derived string comes from your own
 ROM or record at runtime.
+
+**Per-mon stats — `moves`, `evs`, `ivs`.** Each battler's record carries its
+full 100-byte party mon, so the panel can decode and show, for every mon:
+
+- `moves` — the mon's up to four move **names, read from YOUR ROM**
+  (`gMoveNames`), falling back to `Move #<id>` if a name can't be decoded.
+- `evs` — the six effort values (`HP Atk Def SpA SpD Spe`) and a bold
+  **`Sum NNN/510`** total.
+- `ivs` — the six individual values and a bold **`Sum NNN/186`** total; a
+  perfect (31) IV is flagged with a `*`, and an all-31 mon is marked
+  `PERFECT`.
+
+A mon whose checksum does not verify shows `(stats unavailable)` rather than
+untrusted numbers.
+
+**Cycling the stat views over time — `--panel-cycle SECONDS`.** Because the
+output is a non-interactive video, you can rotate the stat pages instead of
+stacking them: `--panel-cycle 5` shows each page for 5 seconds and loops for
+the whole battle, so a viewer sees the moves page, then the EVs page, then
+the IVs page, over and over. The static header/teams context stays put; only
+the stat block swaps. `--panel-cycle-pages moves,evs,ivs` (default all three)
+picks which pages to include. `--panel-cycle 0` (the default) keeps a single
+static panel — put `moves`/`evs`/`ivs` in `--panel-info` to stack them
+instead. Example:
+
+```bash
+# cycle moves -> EVs -> IVs, 5 s each, over the battle
+python3 -m rec2mp4 my.rec --panel-info header,teams --panel-cycle 5
+
+# just flip EVs and IVs, 4 s each
+python3 -m rec2mp4 my.rec --panel-cycle 4 --panel-cycle-pages evs,ivs
+```
+
+The JSON sidecar records how the panel was drawn: `options.panel_mode`
+(`static` or `cycle`) plus `panel_cycle_seconds` and `panel_cycle_pages`
+when cycling.
 
 The panel needs Pillow (`pip install pillow` into whatever Python runs
 rec2mp4 — the conda env from Setup already has it). Without Pillow the
@@ -309,9 +348,11 @@ What it does:
   double-clicking a row opens a details window with the full record summary
   and, after a conversion, that record's complete log.
 * **Settings pane** — mirrors the CLI options 1:1 (animations, text speed,
-  scale, audio, side panel + per-section checkboxes, plain names, JSON
-  sidecar, output folder, ROM/save pickers prefilled with the `local/`
-  defaults when those files exist).
+  scale, audio, side panel + per-section checkboxes — now including the
+  `moves` / `evs` / `ivs` stat sections — a **"Cycle stats every N seconds"**
+  spinbox with per-page (`moves`/`evs`/`ivs`) checkboxes for the time-cycling
+  panel, plain names, JSON sidecar, output folder, ROM/save pickers prefilled
+  with the `local/` defaults when those files exist).
 * **Convert** — runs the batch on a worker thread; per-row status
   (`waiting` / `converting` / `OK` / `TRUNC` / `FAILED`) plus a live
   progress line fed by the driver's own log and frame counter. **Cancel**
