@@ -161,7 +161,8 @@ python3 -m rec2mp4 my.rec --panel off
 Options: `-o/--outdir` (default `out/`), `--rom` (default `local/rom.gba`),
 `--sav` (default `local/template.sav`), `--headed`, `--scale N`, `--no-audio`,
 `--anims on|off|record` (default `on`), `--text-speed slow|mid|fast|record`
-(default `record`), `--panel right|left|off` (default `right`),
+(default `record`), `--pov player|opponent` (default `player` — see
+"Opponent POV"), `--panel right|left|off` (default `right`),
 `--panel-info CSV` (default `all` — see "The battle-info side panel"),
 `--plain-names`, `--no-sidecar`, `--info-only`,
 `--max-seconds N` (replay timeout, default 1800), `--pix-fmt`
@@ -194,6 +195,39 @@ The panel needs Pillow (`pip install pillow` into whatever Python runs
 rec2mp4 — the conda env from Setup already has it). Without Pillow the
 conversion still works: a warning is printed and videos are written
 without the panel. `--panel off` never touches Pillow.
+
+### Opponent POV (experimental) — `--pov opponent`
+
+`--pov opponent` flips the camera to the **other side** of the battle: the
+opponent's team stands at the bottom with player-style HP boxes, and your
+recorded team appears as the enemy at the top. It works by dressing the
+record up as a *non-master link record* and letting the game's own
+link-replay path render it (swap the two party blocks, set the
+`RECORDED_LINK` battle-type bit, clear `IS_MASTER`/`RECORDED_IS_MASTER`,
+fabricate the now-bottom link player, and repoint `multiplayerId`; the input
+lanes are battler-indexed and are left untouched). Every recorded action is
+still attributed to the correct side.
+
+**Honest caveat — faithful only for genuine link records.** The game only
+offers a perspective switch for *link* battles, where both sides' inputs
+were human-recorded and no AI runs at playback. For the **Frontier (vs-AI)
+records this tool normally handles it is a "what-if"**: the opponent's moves
+are re-decided by a live AI whose RNG consumption cannot be reproduced from
+the record, so the replay **diverges after about turn 1** and typically ends
+early through the engine's clean teleport-quit fade (a natural fade to
+black, not a crash — the video just stops mid-battle, ~35 s). It is *not*
+the battle as it happened. Outputs are tagged loudly: the filename gets a
+` [opponent POV]` suffix, the panel header shows "Opponent POV
+(experimental)", and the JSON sidecar records `pov`, a `pov_faithful` bool
+(false for Frontier records) and a `pov_note` explaining the divergence. If
+you ever record a real link battle, the same flip is faithful and
+`pov_faithful` is true. Full derivation, decomp citations and evidence
+frames: [`docs/research/opponent-pov.md`](docs/research/opponent-pov.md).
+
+```bash
+# Watch a Frontier record from the opponent's side (a what-if view)
+python3 -m rec2mp4 my.rec --pov opponent
+```
 
 ### Streak-aware export filenames (PokeDNA)
 

@@ -123,6 +123,8 @@ def render_panel(info: dict, extras: dict, size: tuple[int, int]) -> bytes:
         sections         tuple[str]  parse_panel_info() result (default all)
         opponent_a_label str|None    resolved display name (pipeline)
         opponent_b_label str|None
+        pov              str         'player' | 'opponent' (header note)
+        pov_faithful     bool        opponent POV faithful (link record)?
     size   — (width, height) in pixels; the pipeline passes
              (scale*120, scale*160) so the panel is half the game's width
              at the same height.
@@ -195,6 +197,10 @@ def render_panel(info: dict, extras: dict, size: tuple[int, int]) -> bytes:
         streak = extras.get("streak")
         if streak is not None:
             line("Streak %d" % streak, f_body, px_body, _GOLD)
+        if extras.get("pov") == "opponent":
+            line("Opponent POV (experimental)", f_small, px_small, _RED)
+            if not extras.get("pov_faithful"):
+                line("what-if: replay diverges", f_small, px_small, _DIM)
         rule()
 
     # ---------------------------------------------------------- players

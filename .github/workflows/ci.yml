@@ -49,6 +49,8 @@ jobs:
         run: python tests/test_naming.py
       - name: panel / species / streak-stem / pipeline suite
         run: python tests/test_panel.py
+      - name: opponent-POV transform / naming / sidecar suite (asset-free)
+        run: python tests/test_pov.py
       - name: GUI pure-logic suite (widget smoke skips headless)
         run: python tests/test_gui.py
 
