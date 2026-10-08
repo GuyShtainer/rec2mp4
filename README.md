@@ -47,6 +47,16 @@ Detail of what that covers:
   batch above exercised. One real-world fix over the researched plan: the
   intro movie ignores input for its first ~60 frames, so every menu press uses
   a press-with-retry loop instead of a one-shot press.
+- **Panel layouts, frame preview, parallel batches, opening/end cards**
+  (2026-08-03/04, newer than the batch above) — exercised on real records on
+  macOS: a `--panel top` band, a four-side layout with time-cycling stats
+  (1640×864, duration matching the game), `--preview` PNGs in ~1 s, a
+  4-record `--jobs 4` batch, an end card built from a `state.*` sidecar, and
+  an opening card carrying the opponent's own pre-battle line — whose audio
+  delay was verified by measurement: silence before the game starts, and the
+  game audio bit-identical in level to the un-carded build 3 s later.
+  Not yet run on Windows/Linux; the asset-free half is covered by
+  `tests/test_layout.py` on all three CI OSes.
 
 Not yet validated: Windows, non-US ROMs (unsupported by design — the RAM
 addresses are US-specific), link-battle records (none in the test set), and
@@ -158,16 +168,27 @@ python3 -m rec2mp4 my.rec --anims record --text-speed record
 
 # No side panel (plain game video, exactly the pre-panel output)
 python3 -m rec2mp4 my.rec --panel off
+
+# See a few composited frames first — no video, ~1 s (see "Preview frames")
+python3 -m rec2mp4 my.rec --preview
+
+# A folder, one record per CPU, with a panel layout you designed
+python3 -m rec2mp4 local/recs -o out --jobs 0 --layout my-layout.json
 ```
 
 Options: `-o/--outdir` (default `out/`), `--rom` (default `local/rom.gba`),
 `--sav` (default `local/template.sav`), `--headed`, `--scale N`, `--no-audio`,
 `--anims on|off|record` (default `on`), `--text-speed slow|mid|fast|record`
 (default `record`), `--pov player|opponent` (default `player` — see
-"Opponent POV"), `--panel right|left|off` (default `right`),
+"Opponent POV"), `--panel right|left|top|bottom|off` (default `right`),
 `--panel-info CSV` (default `all` — see "The battle-info side panel"),
-`--plain-names`, `--no-sidecar`, `--info-only`,
-`--max-seconds N` (replay timeout, default 1800), `--pix-fmt`
+`--layout FILE|default` (a designed panel layout — see "Designing your own
+panel"), `--intro-card SECONDS` (the opponent's pre-battle line as an
+opening card, default 3), `--end-card SECONDS` (trainer-state card on the
+last frames, default 3), `-j/--jobs N` (records converted at once, default 0 = one per
+CPU), `--preview [N]` / `--preview-start` / `--preview-every` (composited
+preview PNGs instead of a video), `--plain-names`, `--no-sidecar`,
+`--info-only`, `--max-seconds N` (replay timeout, default 1800), `--pix-fmt`
 (raw-framebuffer format handed to ffmpeg, default `rgb0`).
 Exit code is non-zero if any record fails.
 
@@ -235,6 +256,175 @@ rec2mp4 — the conda env from Setup already has it). Without Pillow the
 conversion still works: a warning is printed and videos are written
 without the panel. `--panel off` never touches Pillow.
 
+### Designing your own panel — `--layout`, `rec2mp4-designer`
+
+The stacked panel above is one fixed arrangement. A **layout** replaces it
+with free-form geometry: information blocks you place and size yourself, on
+any of the four sides at once.
+
+```
++-----------------------------------------+
+|                  top                    |   left/right are columns
++--------+-----------------------+--------+   (game height)
+|  left  |      game video       | right  |
++--------+-----------------------+--------+   top/bottom are bands spanning
+|                 bottom                  |   the FULL composited width
++-----------------------------------------+
+```
+
+Open the designer — from the GUI's **Design panel…** button (it hands over
+the selected record and your ROM, so the live preview shows *your* battle),
+or standalone:
+
+```bash
+python3 -m rec2mp4.designer            # or: rec2mp4-designer my-layout.json
+```
+
+The canvas shows the finished frame. Drag a block to move it, drag its
+bottom-right corner to resize, double-click to hide/show it, `Delete` to
+remove it, arrow keys to nudge.
+
+**Zoom** with the `−` / `+` / `Fit` buttons, `⌘+` / `⌘-` / `⌘0` (`Ctrl` on
+Windows/Linux) or `⌘`/`Ctrl` + scroll wheel; 100 % means "the whole frame
+fits", anything above that scrolls, and past 1:1 the preview switches to
+nearest-neighbour so you can see exactly where a block's edge lands. Plain
+scroll pans vertically, `Shift`+scroll horizontally.
+
+**Undo / redo** with the toolbar buttons or `⌘Z` / `⌘Y` (and `⌘⇧Z`), with the
+`Ctrl` equivalents bound for Windows/Linux. Every edit is undoable — drags,
+resizes, adding or deleting a block, toggling a panel side, thickness,
+backgrounds, colours, presets — and a drag is a single step, not one per
+mouse-move. The side pane sets, per **panel**: which
+sides exist, thickness (in GBA units — 240×160 is the game), background
+colour, a background **image** (cover / contain / stretch / tile / center,
+with a dim slider); and per **block**: which section it draws, font scale,
+alignment, text/caption/accent colours, its own background + opacity,
+border, corner radius, padding, line spacing, word wrap and overflow
+behaviour. `text` blocks hold whatever you type (a title, a handle);
+`rule`/`frame` blocks are dividers and boxes. Presets seed a right column,
+a band, or all four sides at once. **Save** writes a plain JSON file, and
+**Use in conversion** hands it back to the GUI.
+
+```bash
+python3 -m rec2mp4 my.rec --layout my-layout.json
+python3 -m rec2mp4 my.rec --panel top          # a generated band layout
+python3 -m rec2mp4 my.rec --layout default     # generated, for --panel's side
+```
+
+`--layout default` is worth knowing: because each section gets its **own
+box**, a full 3v3's moves/EVs/IVs all fit instead of overflowing one shared
+column. When a box still cannot fit its content at the minimum legible font,
+the block prints a `+N` marker rather than silently dropping rows.
+
+Layout files are versioned JSON (`rec2mp4_layout: 1`) and are validated on
+load: an unknown section, a bad colour, two panels on one side or a
+too-thin panel is an error before any emulation starts. Panel thickness is
+kept even so every composited dimension stays even for yuv420p at any
+`--scale`.
+
+### Preview frames before converting — `--preview`
+
+A full conversion replays the whole battle. To see what the output will look
+like first — panel layout, colours, `--scale`, and that the record replays
+at all — grab a few composited frames instead:
+
+```bash
+python3 -m rec2mp4 my.rec --preview          # 4 PNGs into the output folder
+python3 -m rec2mp4 my.rec --preview 6 --preview-start 3 --preview-every 2
+```
+
+Each PNG is the **real output frame** — the game video with the real panel
+beside it — captured N seconds into the battle. It boots the ROM and drives
+the same menu path, then stops as soon as it has the frames it needs
+(typically ~1 second of wall clock, versus a full replay). The GUI's
+**Preview frames…** button does the same for the selected record and opens a
+viewer you can page through and save from; the designer then draws your
+layout over that real frame.
+
+### Converting a queue in parallel — `--jobs`
+
+A batch converts **one record per CPU** by default, each in its own process
+(`--jobs 0` = auto; `--jobs 1` = the classic in-process loop with live
+interleaved logs; the GUI has a *Convert in parallel* checkbox and a worker
+count). Output names are reserved in the parent process before dispatch, so
+two workers can never claim the same `.mp4`.
+
+Why per record and not finer: a replay is strictly sequential — frame *N+1*
+depends on the emulator and RNG state at frame *N* — so a single video
+cannot be split across cores. If a worker process dies outright, the records
+it had not finished are reported `FAILED` with a "retry with `--jobs 1`" hint
+rather than hanging the batch.
+
+**The thread budget matters more than the job count.** One ffmpeg spawns
+**55 threads** on a 12-core machine (x264 sizes itself for the whole box), so
+N workers left alone ask for 55 × N threads and the machine spends its time
+context-switching instead of encoding — a wall of red in `htop`, and kernel
+time in `time`. rec2mp4 therefore divides the cores among the workers: each
+ffmpeg gets `cores / jobs` threads (`--jobs 1` still gets everything);
+`--encoder-threads N` overrides the split.
+
+Measured on 6 records, `--jobs 12`, 12 cores, **idle machine**:
+
+| | uncapped (55 threads each) | capped (1 thread each) |
+|---|---|---|
+| wall clock | 1 m 11 s | **1 m 03 s** (−12 %) |
+| user CPU | 8 m 58 s | 7 m 35 s |
+| **kernel CPU** | **1 m 53 s** | **0 m 23 s** (−5×) |
+
+Read that honestly: on an *idle* machine with more cores than work, the
+oversubscription mostly burns CPU (−27 % total CPU) rather than wall clock.
+The wall-clock cost shows up when the cores are actually contended — a longer
+batch, or anything else running. A first measurement here showed a 1.7×
+wall-clock win, but that run had been polluted by another batch still
+finishing; on a genuinely idle machine the two arms tied. The kernel-time and
+total-CPU reductions are the reliable results.
+
+### The opponent's pre-battle line — the opening card (`--intro-card`)
+
+In the Battle Frontier the opponent taunts you before the fight. That line is
+**not in the record** — a `.rec` replays the battle only, starting at the
+engine's "<TRAINER> would like to battle!" — but it *is* in the ROM, keyed by
+the same opponent id the record carries (`gBattleFrontierTrainers[id]
+.speechBefore`, six Easy Chat words). rec2mp4 decodes it from **your** ROM and
+opens the video with it:
+
+```
+              VS PARASOL LADY JULIANA
+               Battle Dome - Open Level
+                 "I THINK I AM
+              SHOPPING TOO MUCH"
+```
+
+`--intro-card SECONDS` (default 3, `0` disables). The card is full-frame and
+plays before the game video; the audio is delayed to match, so the battle stays
+in sync to the sample. It also shows up as frame 0 of `--preview`, and the
+sidecar records `intro_card_seconds` + the exact `intro_card_speech`.
+
+Opponents whose greeting is **not** in the ROM get no card: record-mix friends
+and apprentices keep theirs in the save (not in the `.rec`), and Frontier Brains
+have scripted dialogue rather than an Easy Chat line. Nothing is shipped — the
+words come out of your own ROM at runtime, like every other name rec2mp4 shows.
+
+### The trainer's save state — `trainer` section and the end card
+
+PokeDNA writes a `<stem>.txt` next to each exported `.rec` whose
+machine-readable `state.*` block carries the save the record came out of:
+playtime, Pokédex seen/caught, Battle Points, and the seven Frontier symbols
+(`docs/REC-SIDECAR.md`). rec2mp4 reads it and uses it twice:
+
+- the **`trainer` panel section** (in `--panel-info`, and a block kind in the
+  designer) shows playtime / Pokédex / BP plus the symbols drawn as seven
+  pips in Frontier Pass order (Tower → Pyramid; dark = none, silver, gold);
+- the **end card** holds that same summary full-frame over the last seconds
+  of the video: `--end-card 3` (the default; `0` turns it off) — the bookend
+  to the opening card above.
+
+Every key is optional and a missing one is never shown as a zero — a Ruby
+record has no symbols at all, and a record with no `.txt` gets no card. The
+card is drawn in the *same* encode pass as the panel composite, so it costs
+a few seconds of video, not a second pass over the whole file. The parsed
+state is also copied into the JSON sidecar as `trainer_state`.
+
 ### Opponent POV (experimental) — `--pov opponent`
 
 `--pov opponent` flips the camera to the **other side** of the battle: the
@@ -282,6 +472,29 @@ exactly as before. If a `<same stem>.txt` info file sits next to the
 `.rec` (PokeDNA's future export sidecar), its lines are stored in the JSON
 sidecar as `export_info` and the first few short lines are rendered in the
 panel's `export` section.
+
+### Where the videos go, and what they are called
+
+Output is grouped **by facility** and each finished file carries its
+**outcome**:
+
+```
+out/
+  Battle Arena/
+    GUYA_Arena-O-28_… - Battle Arena Open vs Frontier Brain (streak 28) [WON].mp4
+  Battle Dome/
+    GUYA_… - Battle Dome Open vs PARASOL LADY JULIANA [WON].mp4
+```
+
+The streak comes from PokeDNA's file name and is known before converting; the
+**outcome is only knowable once the replay ends**, so the finished file is
+renamed at that point (same folder, so the rename is atomic) and the JSON
+sidecar — written afterwards — always records the final name. Turn either off
+with `--no-facility-folders` / `--no-outcome-in-name`, or the matching
+checkboxes in the GUI.
+
+In the GUI, **streak** and **outcome** are columns of their own: the streak
+fills in the moment a record is added, the outcome when it finishes.
 
 ### Output names & the JSON sidecar
 
@@ -336,7 +549,11 @@ macOS/Windows ship Tk support):
 ```bash
 python -m rec2mp4.gui        # from a clone
 rec2mp4-gui                  # if installed with pip (gui-script entry point)
+python -m rec2mp4.designer   # the panel designer on its own
 ```
+
+…or double-click an icon — see "Desktop icon" below for the macOS `.app` and
+the Windows shortcut.
 
 What it does:
 
@@ -348,16 +565,34 @@ What it does:
   double-clicking a row opens a details window with the full record summary
   and, after a conversion, that record's complete log.
 * **Settings pane** — mirrors the CLI options 1:1 (animations, text speed,
-  scale, audio, side panel + per-section checkboxes — now including the
-  `moves` / `evs` / `ivs` stat sections — a **"Cycle stats every N seconds"**
-  spinbox with per-page (`moves`/`evs`/`ivs`) checkboxes for the time-cycling
-  panel, plain names, JSON sidecar, output folder, ROM/save pickers prefilled
-  with the `local/` defaults when those files exist).
-* **Convert** — runs the batch on a worker thread; per-row status
-  (`waiting` / `converting` / `OK` / `TRUNC` / `FAILED`) plus a live
-  progress line fed by the driver's own log and frame counter. **Cancel**
-  finishes the record in flight, then stops. "Open output folder" opens
-  Finder/Explorer on the output directory.
+  scale, audio, panel side + per-section checkboxes — including the
+  `trainer` and `moves` / `evs` / `ivs` stat sections — a **"Cycle stats
+  every N seconds"** spinbox with per-page (`moves`/`evs`/`ivs`) checkboxes
+  for the time-cycling panel, a **layout** field with **Design panel…**, a
+  **Convert in parallel** checkbox + worker count, **Cards** spinboxes for the
+  opening and end cards, plain names, JSON sidecar, output folder, ROM/save pickers prefilled with
+  the `local/` defaults when those files exist).
+* **Preview frames…** — replays only the first seconds of the selected
+  record and opens a viewer of the real composited frames (arrow keys to
+  page, save one or all). No video is encoded; see "Preview frames".
+* **Design panel…** — opens the visual panel designer on the current layout,
+  seeded with the selected record, your ROM and (after a preview) a real
+  game frame to design against. "Use in conversion" saves the layout and
+  fills the layout field.
+* **Convert** — runs the batch on a worker thread, by default **one record
+  per CPU in its own process**; per-row status (`waiting` / `converting` /
+  `OK` / `TRUNC` / `FAILED`). **Live progress appears in each record's own
+  Details cell** — with several conversions running at once, a single shared
+  status line just flickered between them — and the bottom bar reports the
+  batch (`3/10 done · 2 converting`). When a record finishes, its final
+  result replaces the live text in the same cell. **Cancel** finishes the
+  records in flight, then stops. **Cancel all** stops everything at once,
+  including the conversions already running: the replays check for it every
+  few emulated frames and the ffmpeg stages are polled rather than waited on,
+  so a batch halts in about a second even mid-battle. Cancelled records drop
+  their partial video and are reported `CANCELLED` — measured: 4 running
+  records, all stopped 1.6 s after the click, nothing left behind. "Open
+  output folder" opens Finder/Explorer on the output directory.
 
 Converting still needs everything the CLI needs — the emulator stack from
 "Setup" (vendored mGBA bindings + ffmpeg) plus **your own** ROM and a
@@ -367,6 +602,54 @@ installed at all. Honest status: the GUI is newly built and has been
 exercised on macOS only (the pure-logic layer is covered by
 `tests/test_gui.py` on all three CI OSes; the widget smoke test runs where
 a display exists). Screenshots are deliberately not included.
+
+## Desktop icon — double-click to launch
+
+Both platforms get a proper clickable icon. The artwork is **generated**, not
+stored as a blob: `tools/make_icons.py` draws it at every size natively (a 16 px
+taskbar icon is drawn as a 16 px icon, not squashed down from 1024), and writes
+`assets/icon.png`, a multi-size `assets/rec2mp4.ico` and, on macOS,
+`assets/rec2mp4.icns`. It is deliberately original — a film-sprocketed screen
+with a gold play triangle and a red REC dot — so it carries no game-derived
+shape or colour.
+
+```bash
+python tools/make_icons.py          # regenerate the icons (needs Pillow)
+```
+
+**macOS** — build a real `.app`, then double-click it (or drag it to
+`/Applications`, or keep it in the Dock):
+
+```bash
+# run this with the env that has the stack, so the app launches THAT python
+/path/to/rec2mp4-env/bin/python tools/make_macos_app.py      # -> dist/rec2mp4.app
+open dist/rec2mp4.app
+```
+
+**Windows** — make Desktop + Start Menu shortcuts carrying the icon:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\make_windows_shortcut.ps1
+# or: ... -Python C:\path\to\pythonw.exe
+```
+
+`tools\rec2mp4-gui.cmd` is a plain double-clickable alternative inside the
+repo (a `.cmd` cannot carry its own icon, so the shortcut is the nicer route).
+
+**What these are, honestly:** *launchers*, not frozen distributables. They start
+the rec2mp4 in your working copy using an interpreter that has Pillow, the
+vendored mGBA bindings and ffmpeg — the same requirements as running it from a
+terminal. Both bake in the interpreter and the repo path at build time, and
+both can be overridden at launch (`REC2MP4_PYTHON`, `REC2MP4_HOME` on macOS;
+`-Python` / `REC2MP4_PYTHON` on Windows). If the interpreter has moved, the
+macOS app says so in a dialog instead of failing silently.
+
+A **self-contained** app (no Python needed) is a bigger job and is not built:
+PyInstaller/py2app would have to bundle `vendor/mgba`'s native bindings *and* an
+ffmpeg binary, and the frozen entry point must call
+`multiprocessing.freeze_support()` or `--jobs > 1` spawns new copies of the app
+instead of workers. That call is already in both entry points, so the door is
+open.
 
 ## Windows notes
 
