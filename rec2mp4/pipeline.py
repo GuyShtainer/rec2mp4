@@ -1751,6 +1751,15 @@ def convert_one(rec_path, settings: ConvertSettings, log: Callable = print,
         err = _default_err
 
     if ctx is None:
+        # Validate the record BEFORE touching the ROM / save / emulator stack,
+        # so a bad record is rejected as INVALID even on a host that has none
+        # of them (CI, a laptop with only the parser) instead of surfacing as
+        # "ROM not found". Silent pre-pass; the real pass below logs.
+        pre = prepare_record(rp, settings, None, log=lambda *_: None,
+                             err=lambda *_: None)
+        if "result" in pre:
+            return prepare_record(rp, settings, None, log=log,
+                                  err=err)["result"]
         ctx = load_context(settings, log=log, err=err)
 
     prep = prepare_record(rp, settings, ctx, log=log, err=err)

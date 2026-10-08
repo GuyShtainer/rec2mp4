@@ -119,5 +119,7 @@ jobs:
       - name: install libmgba (macOS only)
         if: runner.os == 'macOS'
         run: brew install mgba
+      - name: install cffi (the bindings' runtime dependency)
+        run: python -m pip install cffi
       - name: fetch prebuilt bindings into vendor/ + import smoke test
         run: python tools/fetch_bindings.py
