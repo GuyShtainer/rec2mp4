@@ -335,6 +335,15 @@ def test_panel_precheck():
 
 def test_widget_smoke():
     print("-- widget construction smoke (display required)")
+    # Opt-in only: on GitHub's macOS and Windows runners tk.Tk() neither
+    # raises nor returns -- it blocked the suite for 27 minutes on
+    # 2026-10-08 -- so the widget smoke runs only where a human asked for
+    # it (REC2MP4_GUI_SMOKE=1). The pure-logic checks above cover the GUI
+    # without a window.
+    if os.environ.get("REC2MP4_GUI_SMOKE") != "1":
+        print("   SKIP: set REC2MP4_GUI_SMOKE=1 to build the window "
+              "(CI runners hang in Tk())")
+        return
     if gui.tk is None:
         print("   SKIP: tkinter not available in this Python")
         return

@@ -49,6 +49,7 @@ on:
 jobs:
   tests:
     name: tests (${{ matrix.os }})
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -104,6 +105,7 @@ jobs:
 
   bindings:
     name: mGBA bindings fetch + import (${{ matrix.os }})
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -116,9 +118,11 @@ jobs:
           python-version: '3.12'
       # The macOS bindings dynamically link brew's libmgba.0.10.dylib; the
       # win64 zip is self-contained (mgba.dll + dependency DLLs bundled).
-      - name: install libmgba (macOS only)
+      # The prebuilt macOS _pylib.abi3.so also links brew's ffmpeg
+      # (libavcodec.62.dylib), so ffmpeg must be installed next to mgba.
+      - name: install libmgba + ffmpeg (macOS only)
         if: runner.os == 'macOS'
-        run: brew install mgba
+        run: brew install mgba ffmpeg
       - name: install cffi (the bindings' runtime dependency)
         run: python -m pip install cffi
       - name: fetch prebuilt bindings into vendor/ + import smoke test
