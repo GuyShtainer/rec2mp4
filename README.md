@@ -460,7 +460,7 @@ python3 -m rec2mp4 my.rec --pov opponent
 
 ### Streak-aware export filenames (PokeDNA)
 
-PokeDNA's upcoming export format names records
+PokeDNA (v3.0.0 and later) names exported records
 `<PLAYER>_<Facility>-<O|50>-<streak>_<date>_<time>.rec`
 (e.g. `GUYA_Factory-50-7_27-07-2026_10-40.rec`, `O` = Open Level). rec2mp4
 recognizes that stem: the streak lands in the output filename
@@ -469,7 +469,7 @@ recognizes that stem: the streak lands in the output filename
 against the record itself; on a mismatch a warning is printed and the
 record is trusted. Old-format stems (`GUYA_27-07-2026_10-40.rec`) behave
 exactly as before. If a `<same stem>.txt` info file sits next to the
-`.rec` (PokeDNA's future export sidecar), its lines are stored in the JSON
+`.rec` (the sidecar PokeDNA v3.0.0 writes with every export), its lines are stored in the JSON
 sidecar as `export_info` and the first few short lines are rendered in the
 panel's `export` section.
 
