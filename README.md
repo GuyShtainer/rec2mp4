@@ -24,6 +24,24 @@ into a save image, boots a **user-supplied** US Emerald ROM in a headless mGBA
 core, drives the menus to Frontier Pass → BATTLE RECORD, lets the game replay
 the battle by itself, and pipes the emulator's frames and audio into ffmpeg.
 
+## What it adds to the video
+
+The video is the game's own replay, with a text-only side panel next to it and an end card
+over the last seconds. The images below are rec2mp4's own renders of that panel and card,
+made from a real Battle Arena record (a 14-win streak) and its PokeDNA `.txt` sidecar. They
+contain no game pixels. Names and moves are read from the user's ROM and record at run
+time. Game footage itself is deliberately not shown in this repo.
+
+| Panel, default page | Moves page | EVs page | IVs page |
+|---|---|---|---|
+| ![Side panel: facility, streak, recorder, opponent, both teams, outcome WON in 2:03](https://github.com/GuyShtainer/rec2mp4/releases/download/v1.1.0/panel-overview.png) | ![Moves page: every Pokémon's four moves](https://github.com/GuyShtainer/rec2mp4/releases/download/v1.1.0/panel-moves.png) | ![EVs page: per-stat EVs and their sum](https://github.com/GuyShtainer/rec2mp4/releases/download/v1.1.0/panel-evs.png) | ![IVs page: per-stat IVs and their sum](https://github.com/GuyShtainer/rec2mp4/releases/download/v1.1.0/panel-ivs.png) |
+
+![End card: trainer name, play time, Pokédex counts, Battle Points, Frontier symbols, streak](https://github.com/GuyShtainer/rec2mp4/releases/download/v1.1.0/end-card.png)
+
+By default the panel shows the first page for the whole battle. With `--panel-cycle 5` it
+rotates through the moves, EVs and IVs pages, five seconds each.
+The end card comes from the PokeDNA sidecar (see "The trainer's save state" below).
+
 ## Status — honest, current
 
 **Validated end-to-end on 2026-07-27: all 10 real hardware-exported records
@@ -638,7 +656,7 @@ hint the CLI prints. Queueing and inspecting records works with nothing
 installed at all. Honest status: the GUI is newly built and has been
 exercised on macOS only (the pure-logic layer is covered by
 `tests/test_gui.py` on all three CI OSes; the widget smoke test runs where
-a display exists). Screenshots are deliberately not included.
+a display exists). There are no screenshots of the GUI window itself.
 
 ## Desktop icon — double-click to launch
 
