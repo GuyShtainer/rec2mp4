@@ -22,10 +22,12 @@ from pathlib import Path
 
 from . import rec
 from .pipeline import (                                    # noqa: F401
-    DEFAULT_OUTDIR, DEFAULT_PIX_FMT, DEFAULT_ROM, DEFAULT_SAV,
+    DEFAULT_OUTDIR, DEFAULT_PIX_FMT, DEFAULT_ROM, DEFAULT_SAV, PANEL_SIDES,
+    PREVIEW_COUNT, PREVIEW_SPACING_SECONDS, PREVIEW_START_SECONDS,
     ConvertSettings, PipelineError, build_output_basename, build_sidecar,
-    convert_one, load_context, opponent_label, parse_export_stem,
-    resolve_output_path, sanitize_filename,
+    convert_batch, convert_one, load_context, opponent_label,
+    parse_export_stem, preview_frames, resolve_jobs, resolve_output_path,
+    sanitize_filename,
 )
 
 
@@ -69,16 +71,28 @@ def _build_parser() -> argparse.ArgumentParser:
                    default="record",
                    help="dialogue text speed during the replay "
                         "(default: as recorded)")
-    p.add_argument("--panel", choices=("right", "left", "off"),
+    p.add_argument("--panel", choices=PANEL_SIDES + ("off",),
                    default="right",
-                   help="composite a battle-info side panel onto the video "
+                   help="composite a battle-info panel onto the video "
                         "(default: right). Text only, rendered from the "
-                        "record + YOUR ROM; needs Pillow. 'off' produces "
-                        "the plain game video")
+                        "record + YOUR ROM; needs Pillow. 'top'/'bottom' are "
+                        "full-width bands (they use a generated block layout "
+                        "— see --layout). 'off' produces the plain game video")
+    p.add_argument("--layout", default=None, metavar="FILE",
+                   help="a panel layout .json designed in the GUI's panel "
+                        "designer (rec2mp4-designer): free-form information "
+                        "blocks, per-block fonts/colours, background images, "
+                        "and up to four panels (left/right/top/bottom) at "
+                        "once. Replaces the built-in stacked panel; ignored "
+                        "when --panel off")
     p.add_argument("--panel-info", default="all", metavar="CSV",
                    help="comma-separated panel sections: header, players, "
-                        "opponents, teams, moves, evs, ivs, export, footer — "
-                        "or 'all' (default). 'moves' lists each mon's moves "
+                        "trainer, opponents, teams, moves, evs, ivs, export, "
+                        "footer — or 'all' (default). 'trainer' shows the "
+                        "save state from PokeDNA's '<stem>.txt' sidecar "
+                        "(playtime, Pokedex, BP, Frontier symbols) and draws "
+                        "nothing when there is none. 'moves' lists each "
+                        "mon's moves "
                         "(names read from YOUR ROM); 'evs'/'ivs' show the six "
                         "values plus a bold Sum (EV /510, IV /186, a star on "
                         "perfect IVs); 'export' shows the first lines of a "
@@ -92,6 +106,22 @@ def _build_parser() -> argparse.ArgumentParser:
                    metavar="CSV",
                    help="which stat pages --panel-cycle rotates through: any "
                         "of moves, evs, ivs (default all three)")
+    p.add_argument("--intro-card", type=float, default=3.0, metavar="SECONDS",
+                   help="open the video with SECONDS (default 3) of a card "
+                        "carrying the opponent's pre-battle line — the Easy "
+                        "Chat taunt the Frontier trainer says, read from "
+                        "YOUR ROM by the opponent id in the record. The "
+                        "record itself starts at \"<TRAINER> would like to "
+                        "battle!\" and never had that line. 0 disables it; "
+                        "opponents with no ROM speech (record-mix friends, "
+                        "apprentices) get no card")
+    p.add_argument("--end-card", type=float, default=3.0, metavar="SECONDS",
+                   help="hold a trainer-state card on the last SECONDS of "
+                        "the video (default 3): playtime, Pokedex, Battle "
+                        "Points and the seven Frontier symbols, read from "
+                        "PokeDNA's '<stem>.txt' sidecar. 0 disables it; a "
+                        "record whose sidecar has no 'state.' block never "
+                        "gets one (see docs/REC-SIDECAR.md)")
     p.add_argument("--pov", choices=("player", "opponent"), default="player",
                    help="whose side the camera is on. 'player' (default) is "
                         "the normal replay; 'opponent' flips the camera to "
@@ -111,6 +141,44 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--info-only", action="store_true",
                    help="validate + summarize the record(s), then exit "
                         "without emulating")
+    p.add_argument("--preview", nargs="?", type=int, const=PREVIEW_COUNT,
+                   default=None, metavar="N",
+                   help="do not convert: replay only the first seconds of "
+                        f"each record and write N (default {PREVIEW_COUNT}) "
+                        "composited preview PNGs — the real game frame with "
+                        "the real panel/layout beside it — into the output "
+                        "folder, so you can check the look before spending a "
+                        "full conversion")
+    p.add_argument("--preview-every", type=float,
+                   default=PREVIEW_SPACING_SECONDS, metavar="SECONDS",
+                   help="seconds of battle between preview frames "
+                        f"(default {PREVIEW_SPACING_SECONDS:g})")
+    p.add_argument("--preview-start", type=float,
+                   default=PREVIEW_START_SECONDS, metavar="SECONDS",
+                   help="seconds into the battle for the FIRST preview frame "
+                        f"(default {PREVIEW_START_SECONDS:g})")
+    p.add_argument("-j", "--jobs", type=int, default=0, metavar="N",
+                   help="convert N records at once, each in its own process "
+                        "(default 0 = one per CPU). A replay is strictly "
+                        "sequential, so parallelism is per record: N records "
+                        "on N cores. Use --jobs 1 for the classic in-process "
+                        "loop (live interleaved logs, easier debugging)")
+    p.add_argument("--no-facility-folders", action="store_true",
+                   help="write every video straight into the output folder "
+                        "instead of grouping them by facility "
+                        "(out/Battle Arena/..., out/Battle Dome/...)")
+    p.add_argument("--no-outcome-in-name", action="store_true",
+                   help="do not append the battle's outcome to the file name "
+                        "('... vs PSYCHIC NORTON [WON].mp4'). The outcome is "
+                        "only known once the replay ends, so the finished "
+                        "file is renamed at that point")
+    p.add_argument("--encoder-threads", type=int, default=0, metavar="N",
+                   help="threads each ffmpeg may use (default 0 = one CPU's "
+                        "worth per parallel job, i.e. cores/jobs; with "
+                        "--jobs 1 ffmpeg gets the whole machine). Left "
+                        "uncapped, EVERY worker's x264 sizes itself for all "
+                        "cores — 12 workers asking for 55 threads each is "
+                        "kernel time, not throughput")
     p.add_argument("--max-seconds", type=float, default=1800, metavar="N",
                    help="give up on a replay after N seconds of emulated "
                         "time (default 1800)")
@@ -152,7 +220,40 @@ def _info_only_one(rp: Path) -> tuple[str, str, str]:
     return (rp.name, "OK", f"{info['facility']}, {info['level_mode']}")
 
 
+def _preview_one(rp: Path, settings: ConvertSettings, ctx,
+                 args) -> tuple[str, str, str]:
+    """--preview for one record: write composited preview PNGs, no video."""
+    res = preview_frames(rp, settings, ctx=ctx, count=args.preview,
+                         spacing_seconds=args.preview_every,
+                         start_seconds=args.preview_start)
+    if res["status"] != "OK":
+        print(f"preview failed: {res['detail']}", file=sys.stderr)
+        return (rp.name, res["status"], res["detail"])
+    base = sanitize_filename(rp.stem)[:160] or "record"
+    written = []
+    for n, frame in enumerate(res["frames"], start=1):
+        label = frame.get("label")
+        path = ctx.outdir / (f"{base} - {label}.png" if label
+                             else f"{base} - preview {n}.png")
+        try:
+            path.write_bytes(frame["png"])
+        except OSError as exc:
+            print(f"cannot write {path}: {exc}", file=sys.stderr)
+            return (rp.name, "FAILED", f"write error: {exc}")
+        written.append(path)
+        print(f"preview {n}/{len(res['frames'])} "
+              f"{label or ('@ %.1fs' % frame['seconds'])} -> {path}")
+    size = res["frames"][0]["size"]
+    return (rp.name, "OK",
+            f"{len(written)} preview PNG(s) {size[0]}x{size[1]} "
+            f"-> {written[0].parent}")
+
+
 def main(argv: list[str] | None = None) -> int:
+    # Needed before any process pool if this ever runs frozen; a no-op
+    # otherwise (see convert_batch's spawn requirements).
+    import multiprocessing
+    multiprocessing.freeze_support()
     args = _build_parser().parse_args(argv)
 
     rec_paths = _collect_recs(args.input)
@@ -179,7 +280,12 @@ def main(argv: list[str] | None = None) -> int:
             panel_cycle=args.panel_cycle,
             panel_cycle_pages=tuple(
                 x.strip() for x in args.panel_cycle_pages.split(",")
-                if x.strip()))
+                if x.strip()),
+            layout=args.layout, jobs=args.jobs, end_card=args.end_card,
+            intro_card=args.intro_card,
+            encoder_threads=args.encoder_threads,
+            facility_folders=not args.no_facility_folders,
+            outcome_in_name=not args.no_outcome_in_name)
         try:
             ctx = load_context(settings)
         except PipelineError as exc:
@@ -187,22 +293,58 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     # ------------------------------------------------------------------
-    # Per-record loop: validate -> summarize -> (inject -> replay -> mp4).
+    # Per-record work: validate -> summarize -> (inject -> replay -> mp4).
     # A bad record or a failed replay never stops the batch.
     # ------------------------------------------------------------------
     results: list[tuple[str, str, str]] = []    # (name, status, detail)
     failures = 0
 
-    for rp in rec_paths:
-        print(f"\n=== {rp.name} ===")
-        if args.info_only:
+    if args.info_only:
+        for rp in rec_paths:
+            print(f"\n=== {rp.name} ===")
             row = _info_only_one(rp)
-        else:
-            res = convert_one(rp, settings, ctx=ctx)
-            row = (res["name"], res["status"], res["detail"])
-        results.append(row)
-        if row[1] != "OK":
-            failures += 1
+            results.append(row)
+            if row[1] != "OK":
+                failures += 1
+    elif args.preview is not None:
+        for rp in rec_paths:
+            print(f"\n=== {rp.name} ===")
+            row = _preview_one(rp, settings, ctx, args)
+            results.append(row)
+            if row[1] != "OK":
+                failures += 1
+    else:
+        # jobs > 1 interleaves records across processes, so each record's log
+        # is buffered and printed as one block when it finishes; the classic
+        # sequential mode keeps printing live.
+        n_jobs = resolve_jobs(settings.jobs, len(rec_paths))
+        rows: dict = {}
+
+        def on_start(i, path):
+            if n_jobs == 1:
+                print(f"\n=== {path.name} ===")
+
+        def on_result(i, res):
+            if n_jobs > 1:
+                print(f"\n=== {rec_paths[i].name} ===")
+                for line in res.get("log_lines") or []:
+                    if line.startswith("! "):
+                        print(line[2:], file=sys.stderr)
+                    else:
+                        print(line)
+            rows[i] = (res["name"], res["status"], res["detail"])
+
+        try:
+            convert_batch(rec_paths, settings, ctx=ctx, on_start=on_start,
+                          on_result=on_result)
+        except PipelineError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        for i, rp in enumerate(rec_paths):
+            row = rows.get(i, (rp.name, "FAILED", "not converted"))
+            results.append(row)
+            if row[1] != "OK":
+                failures += 1
 
     # ------------------------------------------------------------------
     # Batch summary

@@ -119,7 +119,8 @@ _G3_PUNCT = {0x00: ' ', 0x1B: 'e',          # 0x1B = e-acute (POKeMANIAC...)
              # names "PKMN BREEDER"/"PKMN RANGER" use the 0x53 0x54 pair.
              0x53: 'PK', 0x54: 'MN',
              0x55: 'PO', 0x56: 'KE', 0x57: 'BL', 0x58: 'OC', 0x59: 'K',
-             0xAB: '!', 0xAC: '?', 0xAD: '.', 0xAE: '-', 0xB4: "'",
+             0xAB: '!', 0xAC: '?', 0xAD: '.', 0xAE: '-', 0xB0: '...',
+             0xB4: "'",
              0xB5: 'M', 0xB6: 'F',          # male/female signs -> M/F
              0xB8: ',', 0xBA: '/', 0xF0: ':'}
 
@@ -293,3 +294,139 @@ def species_name(rom_bytes, internal_id: int) -> str | None:
     if raw is None:
         return None
     return _g3str_strict(raw)
+
+
+# ---------------------------------------------------------------------------
+# Easy Chat — the words a Battle Frontier trainer says before/after a battle
+# ---------------------------------------------------------------------------
+#
+# The pre-battle taunt is NOT in the .rec (the record replays the battle only,
+# starting at the engine's "<TRAINER> would like to battle!"), but it IS in the
+# ROM, keyed by the same trainer id the record carries. Layout facts:
+#
+#   struct EasyChatGroup                  // src/easy_chat.c
+#   {
+#       const void *wordData;             // +0
+#       u16 numWords;                     // +4
+#       u16 numEnabledWords;              // +6
+#   };                                    // sizeof = 8
+#   gEasyChatGroups @ 0x0859D004          // pokeemerald.sym; size 0xB0 = 22*8
+#
+# A word id packs its group and index: id = (group << 9) | index — so the six
+# u16s of `speechBefore` decode independently. Two shapes of wordData, and the
+# ROM's own symbol sizes confirm which is which (verified against every group:
+# 12 bytes/entry for the text groups, 2 for the value groups):
+#
+#   * value groups (POKEMON, MOVE_1, MOVE_2, POKEMON_2) — GetEasyChatWord
+#     returns gSpeciesNames[index] / gMoveNames[index] DIRECTLY: for these the
+#     word id's index field IS the species / move id. The group's own u16
+#     valueList is only the subset the easy-chat UI offers, so it must NOT be
+#     used to decode (and `numWords` must not bound the index). A shipped
+#     speech really does use ids past the list — AROMA LADY JILLIAN's win line
+#     is EC_WORD(MOVE_1, 230) = "SWEET SCENT", and treating 230 as a list index
+#     silently drops the word;
+#   * every other group — 12-byte entries whose first word is a ROM pointer to
+#     the Gen-3-encoded string, indexed by the word id's index field.
+#
+# Nothing here ships: the words are read out of the user's own ROM at runtime,
+# like every other name rec2mp4 displays.
+
+GEASY_CHAT_GROUPS_ADDR = 0x0859D004
+EASY_CHAT_GROUP_COUNT = 22             # EC_NUM_GROUPS
+EC_GROUP_ENTRY_SIZE = 8                # sizeof(struct EasyChatGroup)
+EC_WORD_ENTRY_SIZE = 12                # sizeof(struct EasyChatWordInfo)
+EC_EMPTY_WORD = 0xFFFF                 # an unused slot in a 6-word speech
+
+# Groups whose wordData is a u16 value list rather than text pointers.
+EC_SPECIES_GROUPS = (0, 21)            # EC_GROUP_POKEMON, EC_GROUP_POKEMON_2
+EC_MOVE_GROUPS = (18, 19)              # EC_GROUP_MOVE_1, EC_GROUP_MOVE_2
+
+# Words per speech, and where each speech sits in a BattleFrontierTrainer.
+EASY_CHAT_BATTLE_WORDS_COUNT = 6
+SPEECH_OFFSETS = {"before": 12, "win": 24, "lose": 36}
+
+
+def _u16(rom: bytes, addr: int) -> int | None:
+    raw = _rom_slice(rom, addr, 2)
+    return None if raw is None else int.from_bytes(raw, "little")
+
+
+def _u32(rom: bytes, addr: int) -> int | None:
+    raw = _rom_slice(rom, addr, 4)
+    return None if raw is None else int.from_bytes(raw, "little")
+
+
+def easy_chat_word(rom_bytes, word_id: int) -> str | None:
+    """One Easy Chat word id -> its text, read from the user's ROM.
+
+    Returns None for the empty slot (0xFFFF), an out-of-range group/index, a
+    ROM that is too small / not US Emerald, or bytes that do not decode — a
+    caller should drop the word rather than print a placeholder.
+    """
+    if not isinstance(rom_bytes, (bytes, bytearray, memoryview)):
+        return None
+    rom = bytes(rom_bytes) if not isinstance(rom_bytes, bytes) else rom_bytes
+    if not isinstance(word_id, int) or isinstance(word_id, bool):
+        return None
+    if word_id == EC_EMPTY_WORD or word_id < 0:
+        return None
+    group, index = word_id >> 9, word_id & 0x1FF
+    if group >= EASY_CHAT_GROUP_COUNT:
+        return None
+
+    # Species/move groups resolve straight through the name tables — the
+    # index IS the id, and the group's numWords does not bound it.
+    if group in EC_SPECIES_GROUPS:
+        return species_name(rom, index)
+    if group in EC_MOVE_GROUPS:
+        return move_name(rom, index)
+
+    entry = GEASY_CHAT_GROUPS_ADDR + group * EC_GROUP_ENTRY_SIZE
+    data_ptr = _u32(rom, entry)
+    count = _u16(rom, entry + 4)
+    if data_ptr is None or count is None or index >= count:
+        return None
+    if not (ROM_BASE <= data_ptr < ROM_BASE + 0x02000000):
+        return None
+
+    text_ptr = _u32(rom, data_ptr + index * EC_WORD_ENTRY_SIZE)
+    if text_ptr is None or not (ROM_BASE <= text_ptr < ROM_BASE + 0x02000000):
+        return None
+    # Easy Chat words are short; 32 bytes covers the longest with its EOS.
+    raw = _rom_slice(rom, text_ptr, 32)
+    if raw is None:
+        return None
+    return _g3str_strict(raw)
+
+
+def frontier_trainer_speech(rom_bytes, trainer_id: int,
+                            which: str = "before") -> list[str] | None:
+    """The words a ROM frontier trainer says, e.g. ['I', 'KNOW', 'ONLY', 'YOU'].
+
+    which: 'before' (the pre-battle taunt), 'win' or 'lose' (what they say
+    after, from THEIR point of view). Returns None when the id is not a ROM
+    frontier trainer, the ROM cannot be read, or nothing decodes; empty slots
+    are dropped, so the list is 0..6 words long.
+    """
+    if which not in SPEECH_OFFSETS:
+        raise ValueError("which must be one of %s"
+                         % ", ".join(sorted(SPEECH_OFFSETS)))
+    if not isinstance(rom_bytes, (bytes, bytearray, memoryview)):
+        return None
+    rom = bytes(rom_bytes) if not isinstance(rom_bytes, bytes) else rom_bytes
+    if not isinstance(trainer_id, int) or isinstance(trainer_id, bool):
+        return None
+    if not (0 <= trainer_id < FRONTIER_TRAINERS_COUNT):
+        return None
+    base = (GBATTLE_FRONTIER_TRAINERS_ADDR + trainer_id * BFT_ENTRY_SIZE
+            + SPEECH_OFFSETS[which])
+    raw = _rom_slice(rom, base, EASY_CHAT_BATTLE_WORDS_COUNT * 2)
+    if raw is None:
+        return None
+    words = []
+    for i in range(EASY_CHAT_BATTLE_WORDS_COUNT):
+        wid = int.from_bytes(raw[i * 2:i * 2 + 2], "little")
+        text = easy_chat_word(rom, wid)
+        if text:
+            words.append(text)
+    return words or None

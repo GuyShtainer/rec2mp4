@@ -26,6 +26,8 @@ tests/test_gui.py can exercise it on headless CI runners.
 
 from __future__ import annotations
 
+import io
+import json
 import os
 import queue
 import subprocess
@@ -37,9 +39,11 @@ from pathlib import Path
 
 from . import rec
 from .pipeline import (
-    CONDA_PYTHON, DEFAULT_OUTDIR, DEFAULT_ROM, DEFAULT_SAV,
-    ConvertSettings, PipelineError, convert_one, load_context,
-    pillow_available, pillow_hint, stack_status,
+    CONDA_PYTHON, DEFAULT_OUTDIR, DEFAULT_ROM, DEFAULT_SAV, PANEL_SIDES,
+    PREVIEW_COUNT, PREVIEW_SPACING_SECONDS,
+    ConvertSettings, PipelineError, convert_batch, cpu_jobs, load_context,
+    parse_export_stem, pillow_available, pillow_hint, preview_frames,
+    resolve_jobs, stack_status,
 )
 from .panel import PANEL_SECTIONS, STAT_PAGE_SECTIONS
 
@@ -76,6 +80,10 @@ class QueueItem:
     read_error: str | None = None
     status: str = ST_WAITING
     detail: str = ""
+    # Own columns. The streak is knowable at ADD time (PokeDNA puts it in the
+    # file name); the outcome only after the replay.
+    streak: int | None = None
+    outcome: str = ""
     log_lines: list = field(default_factory=list)
 
     @property
@@ -93,6 +101,9 @@ def load_item(path) -> QueueItem:
                          status=ST_FAILED, detail=f"read error: {exc}")
     info = rec.parse(data)
     item = QueueItem(path=p, info=info)
+    parsed = parse_export_stem(p.stem)
+    if parsed is not None:
+        item.streak = parsed["streak"]
     if not info.get("valid"):
         errs = info.get("errors") or ["invalid record"]
         item.status = ST_INVALID
@@ -124,17 +135,19 @@ def item_opponent(info: dict | None) -> str:
 
 
 def item_row(item: QueueItem) -> tuple:
-    """Tree row values: (file, facility, level, kind, opponent, valid,
-    status, detail)."""
+    """Tree row values, in _COLUMNS order."""
     info = item.info
+    streak = "" if item.streak is None else str(item.streak)
     if item.read_error is not None:
-        return (item.path.name, "?", "?", "?", "?", "unreadable",
-                item.status, item.detail)
+        return (item.path.name, "?", "?", "?", "?", streak, item.outcome,
+                "unreadable", item.status, item.detail)
     return (item.path.name,
             info.get("facility", "?"),
             info.get("level_mode", "?"),
             item_kind(info),
             item_opponent(info),
+            streak,
+            item.outcome,
             "ok" if item.valid else "INVALID",
             item.status,
             item.detail)
@@ -186,11 +199,101 @@ class QueueModel:
         self.items.clear()
         self._seen.clear()
 
+    # Columns the queue can be sorted by, and how to read each one out of an
+    # item. Kept next to the model so the widget layer stays dumb.
+    SORT_KEYS = {
+        "file": lambda it: it.path.name.lower(),
+        "facility": lambda it: (it.info or {}).get("facility", ""),
+        "level": lambda it: (it.info or {}).get("level_mode", ""),
+        "kind": lambda it: item_kind(it.info),
+        "opponent": lambda it: item_opponent(it.info).lower(),
+        "streak": lambda it: (it.streak if it.streak is not None else -1),
+        "outcome": lambda it: it.outcome,
+        "valid": lambda it: ("unreadable" if it.read_error
+                             else ("ok" if it.valid else "INVALID")),
+        "status": lambda it: it.status,
+        "detail": lambda it: it.detail.lower(),
+    }
+
+    def sort(self, column: str, descending: bool = False) -> bool:
+        """Sort in place by a column; False if the column is not sortable.
+
+        Mixed types never meet: each key returns one type for every row, so a
+        blank streak sorts as -1 rather than blowing up against an int.
+        """
+        key = self.SORT_KEYS.get(column)
+        if key is None:
+            return False
+        self.items.sort(key=key, reverse=bool(descending))
+        return True
+
     def convertible_indices(self) -> list[int]:
         """Indices worth sending to the pipeline (readable records;
         convert_one re-validates and reports INVALID ones itself)."""
         return [i for i, it in enumerate(self.items)
                 if it.read_error is None]
+
+
+def settings_path() -> Path:
+    """Where the GUI remembers your last settings.
+
+    Per-user and outside the repo, so it survives a `git clean` and a move of
+    the working copy: %APPDATA%\\rec2mp4 on Windows, ~/.config/rec2mp4 else.
+    """
+    if os.name == "nt":                                # pragma: no cover
+        base = Path(os.environ.get("APPDATA")
+                    or Path.home() / "AppData" / "Roaming")
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME")
+                    or Path.home() / ".config")
+    return base / "rec2mp4" / "gui-settings.json"
+
+
+def load_form(path=None) -> dict:
+    """default_form() with whatever was remembered from last time on top.
+
+    Every remembered value is checked against the default's type and the key
+    must already exist, so an old or hand-edited file can never introduce a
+    surprise setting or wedge the GUI. Missing/corrupt file = the defaults.
+    """
+    form = default_form()
+    path = Path(path) if path else settings_path()
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return form
+    if not isinstance(saved, dict):
+        return form
+    for key, default in form.items():
+        if key not in saved:
+            continue
+        value = saved[key]
+        if isinstance(default, bool):
+            if isinstance(value, bool):
+                form[key] = value
+        elif isinstance(default, list):
+            if isinstance(value, list):
+                form[key] = [v for v in value if isinstance(v, str)]
+        elif isinstance(default, (int, float)):
+            if isinstance(value, (int, float, str)):
+                form[key] = value
+        elif isinstance(value, str):
+            form[key] = value
+    return form
+
+
+def save_form(form: dict, path=None):
+    """Remember the current settings; never raises (it is a convenience)."""
+    path = Path(path) if path else settings_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        keep = {k: v for k, v in form.items() if k in default_form()}
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(keep, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+        return path
+    except (OSError, TypeError, ValueError):
+        return None
 
 
 def default_form() -> dict:
@@ -215,6 +318,15 @@ def default_form() -> dict:
         "panel_cycle": 0.0,
         "panel_cycle_pages": list(STAT_PAGE_SECTIONS),
         "pov": "player",
+        "layout": "",
+        # Multiprocessing is ON by default: one record per CPU. jobs 0 =
+        # auto; the checkbox is what users actually toggle.
+        "parallel": True,
+        "jobs": 0,
+        "end_card": 3.0,
+        "intro_card": 3.0,
+        "facility_folders": True,
+        "outcome_in_name": True,
     }
 
 
@@ -263,6 +375,37 @@ def settings_from_form(form: dict) -> ConvertSettings:
     if not cycle_pages:
         cycle_pages = STAT_PAGE_SECTIONS
 
+    # Parallelism: the checkbox decides on/off, the spinbox how many (0 =
+    # auto = one worker per CPU). jobs=1 is the classic sequential loop.
+    raw_jobs = form.get("jobs", 0)
+    try:
+        jobs = int(raw_jobs or 0)
+    except (TypeError, ValueError):
+        raise ValueError(f"parallel jobs must be a whole number "
+                         f"(got {raw_jobs!r})") from None
+    if jobs < 0:
+        raise ValueError(f"parallel jobs must be >= 0 (got {jobs})")
+    if not form.get("parallel", True):
+        jobs = 1
+
+    raw_card = form.get("end_card", 3.0)
+    try:
+        end_card = float(raw_card or 0.0)
+    except (TypeError, ValueError):
+        raise ValueError(f"end-card seconds must be a number "
+                         f"(got {raw_card!r})") from None
+    if end_card < 0:
+        raise ValueError(f"end-card seconds must be >= 0 (got {end_card})")
+
+    raw_intro = form.get("intro_card", 3.0)
+    try:
+        intro_card = float(raw_intro or 0.0)
+    except (TypeError, ValueError):
+        raise ValueError(f"intro-card seconds must be a number "
+                         f"(got {raw_intro!r})") from None
+    if intro_card < 0:
+        raise ValueError(f"intro-card seconds must be >= 0 (got {intro_card})")
+
     return ConvertSettings(
         rom=form.get("rom") or None,
         sav=form.get("sav") or None,
@@ -278,7 +421,44 @@ def settings_from_form(form: dict) -> ConvertSettings:
         pov=pov,
         panel_cycle=panel_cycle,
         panel_cycle_pages=cycle_pages,
+        layout=(form.get("layout") or None),
+        jobs=jobs,
+        end_card=end_card,
+        intro_card=intro_card,
+        facility_folders=bool(form.get("facility_folders", True)),
+        outcome_in_name=bool(form.get("outcome_in_name", True)),
     )
+
+
+def compact_detail(text: str, limit: int = 78) -> str:
+    """One short line for the queue's Details cell.
+
+    The driver's log is indented and prefixed ("    [driver] [f1234] battle
+    running"); the frame counter in it is noise next to the progress line, so
+    strip the scaffolding and keep the sentence.
+    """
+    line = (str(text) or "").strip().splitlines()[0] if str(text).strip() else ""
+    for prefix in ("! ", "[driver] "):
+        while line.startswith(prefix):
+            line = line[len(prefix):]
+    if line.startswith("[f") and "] " in line:         # drop the frame stamp
+        line = line.split("] ", 1)[1]
+    line = line.strip()
+    return line if len(line) <= limit else line[:limit - 1] + "…"
+
+
+def batch_status(total: int, done: int, running: int,
+                 cancelling: bool = False) -> str:
+    """The bottom bar's line: the BATCH, not whichever record shouted last.
+
+    With several records converting at once, per-record chatter down there was
+    unreadable — it belongs on each record's own row (Details).
+    """
+    if cancelling:
+        return f"cancelling… {done}/{total} done, {running} finishing"
+    if running:
+        return f"{done}/{total} done · {running} converting"
+    return f"{done}/{total} done"
 
 
 def format_result_status(result: dict) -> tuple[str, str]:
@@ -363,9 +543,108 @@ def open_in_file_manager(path) -> None:
 # Widgets — everything below needs a display
 # ---------------------------------------------------------------------------
 
-_COLUMNS = (("file", 250), ("facility", 105), ("level", 75), ("kind", 95),
-            ("opponent", 170), ("valid", 65), ("status", 85),
-            ("detail", 320))
+_COLUMNS = (("file", 230), ("facility", 100), ("level", 70), ("kind", 90),
+            ("opponent", 160), ("streak", 55), ("outcome", 70),
+            ("valid", 60), ("status", 85), ("detail", 300))
+
+
+class PreviewWindow:
+    """Flip through the composited preview frames of one record.
+
+    Each frame is the REAL output frame — game video plus the panel/layout
+    the current settings ask for — so this is what the .mp4 will look like.
+    """
+
+    MAX_SIZE = (1180, 720)
+
+    def __init__(self, master, frames, title="preview", outdir=None):
+        self.frames = list(frames)
+        self.outdir = outdir
+        self.i = 0
+        self._photo = None
+        self.win = tk.Toplevel(master)
+        self.win.title(f"rec2mp4 — preview: {title}")
+
+        bar = ttk.Frame(self.win, padding=(8, 6, 8, 2))
+        bar.pack(side="top", fill="x")
+        ttk.Button(bar, text="◀ Prev",
+                   command=lambda: self.step(-1)).pack(side="left")
+        ttk.Button(bar, text="Next ▶",
+                   command=lambda: self.step(1)).pack(side="left", padx=4)
+        self.label = ttk.Label(bar, text="")
+        self.label.pack(side="left", padx=10)
+        ttk.Button(bar, text="Save this frame…",
+                   command=self.save_one).pack(side="right")
+        ttk.Button(bar, text="Save all…",
+                   command=self.save_all).pack(side="right", padx=4)
+
+        self.canvas = tk.Canvas(self.win, bg="#11141a", highlightthickness=0)
+        self.canvas.pack(side="top", fill="both", expand=True)
+        self.win.bind("<Left>", lambda _e: self.step(-1))
+        self.win.bind("<Right>", lambda _e: self.step(1))
+        self.win.bind("<Escape>", lambda _e: self.win.destroy())
+        self.show()
+
+    def step(self, delta):
+        if self.frames:
+            self.i = (self.i + delta) % len(self.frames)
+            self.show()
+
+    def show(self):
+        if not self.frames:
+            return
+        frame = self.frames[self.i]
+        where = frame.get("label") or ("%.1f s into the battle"
+                                       % frame["seconds"])
+        self.label.configure(
+            text="frame %d/%d — %s — %dx%d"
+                 % (self.i + 1, len(self.frames), where,
+                    frame["size"][0], frame["size"][1]))
+        try:
+            from PIL import Image
+
+            from .designer import to_photo
+            img = Image.open(io.BytesIO(frame["png"]))
+            img.load()
+            k = min(self.MAX_SIZE[0] / img.width,
+                    self.MAX_SIZE[1] / img.height, 1.0)
+            if k < 1.0:
+                img = img.resize((max(1, int(img.width * k)),
+                                  max(1, int(img.height * k))), Image.LANCZOS)
+            self._photo = to_photo(img)
+        except Exception as exc:                       # never kill the window
+            self.canvas.delete("all")
+            self.canvas.create_text(20, 20, anchor="nw", fill="#ff8080",
+                                    text=f"cannot show frame: {exc}")
+            return
+        self.canvas.delete("all")
+        self.canvas.configure(width=self._photo.width(),
+                              height=self._photo.height())
+        self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
+
+    def save_one(self):
+        if not self.frames:
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self.win, title="Save preview frame",
+            defaultextension=".png", initialdir=self.outdir or None,
+            initialfile=f"preview-{self.i + 1}.png",
+            filetypes=[("PNG image", "*.png")])
+        if path:
+            Path(path).write_bytes(self.frames[self.i]["png"])
+
+    def save_all(self):
+        if not self.frames:
+            return
+        folder = filedialog.askdirectory(parent=self.win,
+                                         title="Save every preview frame",
+                                         initialdir=self.outdir or None)
+        if not folder:
+            return
+        for n, frame in enumerate(self.frames, start=1):
+            (Path(folder) / f"preview-{n}.png").write_bytes(frame["png"])
+        self.label.configure(text=f"saved {len(self.frames)} PNG(s) "
+                                  f"to {folder}")
 
 
 class GuiApp:
@@ -383,7 +662,11 @@ class GuiApp:
         self._msgq: queue.Queue = queue.Queue()
         self._worker: threading.Thread | None = None
         self._cancel = threading.Event()
+        self._abort = threading.Event()
         self._batch_warnings: list[str] = []
+        self._batch_total = 0
+        self._batch_done = 0
+        self._batch_running: set = set()
 
         self._build_queue_pane()
         self._build_settings_pane()
@@ -418,8 +701,11 @@ class GuiApp:
         cols = [c for c, _ in _COLUMNS]
         self.tree = ttk.Treeview(top, columns=cols, show="headings",
                                  selectmode="extended", height=12)
+        self._sort_key = None
+        self._sort_desc = False
         for name, width in _COLUMNS:
-            self.tree.heading(name, text=name)
+            self.tree.heading(name, text=name,
+                              command=lambda c=name: self._on_sort(c))
             self.tree.column(name, width=width, stretch=(name == "detail"))
         ysb = ttk.Scrollbar(top, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=ysb.set)
@@ -433,7 +719,7 @@ class GuiApp:
     def _build_settings_pane(self):
         f = ttk.LabelFrame(self.root, text="Settings", padding=8)
         f.pack(side="top", fill="x", padx=8, pady=4)
-        d = default_form()
+        d = load_form()
 
         self.var_anims = tk.StringVar(value=d["anims"])
         self.var_speed = tk.StringVar(value=d["text_speed"])
@@ -451,6 +737,17 @@ class GuiApp:
         self.var_cycle = tk.StringVar(value=str(d["panel_cycle"]))
         self.var_cycle_pages = {s: tk.BooleanVar(value=True)
                                 for s in STAT_PAGE_SECTIONS}
+        self.var_layout = tk.StringVar(value=d["layout"])
+        self.var_parallel = tk.BooleanVar(value=d["parallel"])
+        self.var_jobs = tk.StringVar(value=str(d["jobs"]))
+        self.var_end_card = tk.StringVar(value=str(d["end_card"]))
+        self.var_intro_card = tk.StringVar(value=str(d["intro_card"]))
+        self.var_facility_folders = tk.BooleanVar(
+            value=d["facility_folders"])
+        self.var_outcome_name = tk.BooleanVar(value=d["outcome_in_name"])
+        # Preview-only knobs (not part of ConvertSettings).
+        self.var_prev_count = tk.StringVar(value=str(PREVIEW_COUNT))
+        self.var_prev_every = tk.StringVar(value=str(PREVIEW_SPACING_SECONDS))
 
         row1 = ttk.Frame(f)
         row1.pack(fill="x", pady=2)
@@ -472,17 +769,70 @@ class GuiApp:
                                                       padx=(0, 10))
         ttk.Checkbutton(row1, text="JSON sidecar",
                         variable=self.var_sidecar).pack(side="left")
+        ttk.Checkbutton(row1, text="Folder per facility",
+                        variable=self.var_facility_folders
+                        ).pack(side="left", padx=(10, 0))
+        ttk.Checkbutton(row1, text="Outcome in name",
+                        variable=self.var_outcome_name
+                        ).pack(side="left", padx=(10, 0))
 
         row2 = ttk.Frame(f)
         row2.pack(fill="x", pady=2)
-        ttk.Label(row2, text="Side panel:").pack(side="left")
+        ttk.Label(row2, text="Panel:").pack(side="left")
         ttk.Combobox(row2, textvariable=self.var_panel, state="readonly",
-                     values=("right", "left", "off"), width=6
+                     values=PANEL_SIDES + ("off",), width=7
                      ).pack(side="left", padx=(2, 10))
         ttk.Label(row2, text="Sections:").pack(side="left")
         for s in PANEL_SECTIONS:
             ttk.Checkbutton(row2, text=s, variable=self.var_sections[s]
                             ).pack(side="left", padx=(0, 4))
+
+        row_layout = ttk.Frame(f)
+        row_layout.pack(fill="x", pady=2)
+        ttk.Label(row_layout, text="Layout:", width=8).pack(side="left")
+        ttk.Entry(row_layout, textvariable=self.var_layout).pack(
+            side="left", fill="x", expand=True, padx=2)
+        ttk.Button(row_layout, text="Browse…",
+                   command=lambda: self._pick_file(
+                       self.var_layout, [("rec2mp4 layout", "*.json"),
+                                         ("All files", "*")])
+                   ).pack(side="left")
+        ttk.Button(row_layout, text="Design panel…",
+                   command=self._on_design).pack(side="left", padx=2)
+        ttk.Button(row_layout, text="Clear",
+                   command=lambda: self.var_layout.set("")).pack(side="left")
+
+        row_par = ttk.Frame(f)
+        row_par.pack(fill="x", pady=2)
+        ttk.Checkbutton(row_par, text="Convert in parallel",
+                        variable=self.var_parallel).pack(side="left")
+        ttk.Label(row_par, text="workers:").pack(side="left", padx=(8, 0))
+        ttk.Spinbox(row_par, textvariable=self.var_jobs, from_=0, to=64,
+                    width=4).pack(side="left", padx=2)
+        ttk.Label(row_par,
+                  text=f"(0 = auto: one per CPU — {cpu_jobs()} here)"
+                  ).pack(side="left")
+        ttk.Label(row_par, text="Cards:").pack(side="left", padx=(12, 0))
+        ttk.Spinbox(row_par, textvariable=self.var_intro_card, from_=0, to=30,
+                    increment=1, width=4).pack(side="left", padx=2)
+        ttk.Label(row_par, text="s intro (opponent's line) +").pack(side="left")
+        ttk.Spinbox(row_par, textvariable=self.var_end_card, from_=0, to=30,
+                    increment=1, width=4).pack(side="left", padx=2)
+        ttk.Label(row_par,
+                  text="s end (trainer state; needs PokeDNA's .txt). "
+                       "0 = off").pack(side="left")
+
+        row_prev = ttk.Frame(f)
+        row_prev.pack(fill="x", pady=2)
+        ttk.Label(row_prev, text="Preview:").pack(side="left")
+        ttk.Spinbox(row_prev, textvariable=self.var_prev_count, from_=1, to=20,
+                    width=3).pack(side="left", padx=2)
+        ttk.Label(row_prev, text="frame(s), one every").pack(side="left")
+        ttk.Spinbox(row_prev, textvariable=self.var_prev_every, from_=0.5,
+                    to=60, increment=0.5, width=4).pack(side="left", padx=2)
+        ttk.Label(row_prev,
+                  text="s of battle (the \u201cPreview frames\u2026\u201d "
+                       "button; no video is encoded)").pack(side="left")
 
         row_cycle = ttk.Frame(f)
         row_cycle.pack(fill="x", pady=2)
@@ -534,10 +884,17 @@ class GuiApp:
         self.btn_convert = ttk.Button(bar, text="Convert",
                                       command=self._on_convert)
         self.btn_convert.pack(side="left")
+        self.btn_preview = ttk.Button(bar, text="Preview frames…",
+                                      command=self._on_preview)
+        self.btn_preview.pack(side="left", padx=4)
         self.btn_cancel = ttk.Button(bar, text="Cancel",
                                      command=self._on_cancel,
                                      state="disabled")
         self.btn_cancel.pack(side="left", padx=4)
+        self.btn_cancel_all = ttk.Button(bar, text="Cancel all",
+                                         command=self._on_cancel_all,
+                                         state="disabled")
+        self.btn_cancel_all.pack(side="left", padx=(0, 4))
         ttk.Button(bar, text="Open output folder",
                    command=self._on_open_out).pack(side="left")
         self.progress = ttk.Label(bar, text="idle", anchor="w")
@@ -622,6 +979,13 @@ class GuiApp:
             "panel_cycle_pages": [s for s in STAT_PAGE_SECTIONS
                                   if self.var_cycle_pages[s].get()],
             "pov": self.var_pov.get(),
+            "layout": self.var_layout.get().strip(),
+            "parallel": self.var_parallel.get(),
+            "jobs": self.var_jobs.get(),
+            "end_card": self.var_end_card.get(),
+            "intro_card": self.var_intro_card.get(),
+            "facility_folders": self.var_facility_folders.get(),
+            "outcome_in_name": self.var_outcome_name.get(),
         }
 
     def read_settings(self) -> ConvertSettings:
@@ -667,6 +1031,24 @@ class GuiApp:
         self.model.clear()
         self._refresh_tree()
 
+    def _on_sort(self, column: str) -> None:
+        """Click a heading to sort by it; click it again to reverse."""
+        if self._running() or not self._msgq.empty():
+            return          # indices are in flight; re-ordering would misfile
+        if self._sort_key == column:
+            self._sort_desc = not self._sort_desc
+        else:
+            self._sort_key, self._sort_desc = column, False
+        if self.model.sort(column, self._sort_desc):
+            self._refresh_tree()
+
+    def _sync_headings(self) -> None:
+        for name, _w in _COLUMNS:
+            arrow = ""
+            if name == self._sort_key:
+                arrow = " \u25bc" if self._sort_desc else " \u25b2"
+            self.tree.heading(name, text=name + arrow)
+
     def _refresh_tree(self):
         self.tree.delete(*self.tree.get_children())
         for item in self.model.items:
@@ -678,6 +1060,7 @@ class GuiApp:
             elif item.status in (ST_TRUNC, ST_FAILED):
                 tags = ("trunc",) if item.status == ST_TRUNC else ("invalid",)
             self.tree.insert("", "end", values=item_row(item), tags=tags)
+        self._sync_headings()
         self.queue_label.configure(
             text=f"{len(self.model.items)} record(s) queued")
 
@@ -737,6 +1120,9 @@ class GuiApp:
                     "WITHOUT the info panel."):
                 self.progress.configure(text="cancelled — panel unavailable")
                 return
+        # Remember what was chosen — above all the SAVE, whose default
+        # (local/template.sav) is not the user's own save.
+        save_form(self.read_form())
         self._batch_warnings.clear()
         for i in jobs:
             self.model.items[i].status = ST_WAITING
@@ -744,51 +1130,262 @@ class GuiApp:
             self.model.items[i].log_lines.clear()
         self._refresh_tree()
         self._cancel.clear()
+        self._abort.clear()
+        self._batch_total = len(jobs)
+        self._batch_done = 0
+        self._batch_running.clear()
         self.btn_convert.configure(state="disabled")
+        self.btn_preview.configure(state="disabled")
         self.btn_cancel.configure(state="normal")
-        self.progress.configure(text="starting…")
+        self.btn_cancel_all.configure(state="normal")
+        self._refresh_batch_line()
         paths = [(i, self.model.items[i].path) for i in jobs]
         self._worker = threading.Thread(
             target=self._worker_main, args=(paths, settings), daemon=True)
         self._worker.start()
 
     def _on_cancel(self):
+        """Stop dispatching; let the records in flight finish normally."""
         if self._running():
             self._cancel.set()
-            self.progress.configure(
-                text="cancelling — finishing the current record…")
+            self._refresh_batch_line()
+
+    def _on_cancel_all(self):
+        """Stop everything NOW, including the conversions already running.
+
+        The replays check the abort flag every few emulated frames, so this
+        takes effect in well under a second even mid-battle; each aborted
+        record drops its partial video and comes back CANCELLED.
+        """
+        if self._running():
+            self._cancel.set()
+            self._abort.set()
+            self.progress.configure(text="cancelling everything…")
+
+    # ---- preview -----------------------------------------------------------
+
+    def _preview_target(self) -> int | None:
+        """Which queued row to preview: the selection, else the first
+        convertible record."""
+        sel = self.tree.selection()
+        if sel:
+            idx = self.tree.index(sel[0])
+            if 0 <= idx < len(self.model.items) \
+                    and self.model.items[idx].read_error is None:
+                return idx
+        conv = self.model.convertible_indices()
+        return conv[0] if conv else None
+
+    def _on_preview(self):
+        """Replay a few seconds of ONE record and show the composited frames.
+
+        Same engine, same panel/layout, no encoding — so you can check how the
+        video will look (and that the record replays at all) before spending a
+        full conversion on a queue."""
+        if self._running():
+            return
+        idx = self._preview_target()
+        if idx is None:
+            messagebox.showinfo("rec2mp4", "Add a .rec file first, then "
+                                "select it to preview.")
+            return
+        try:
+            settings = self.read_settings()
+        except (ValueError, tk.TclError) as exc:
+            messagebox.showerror("rec2mp4", f"Bad settings: {exc}")
+            return
+        if not pillow_available():
+            messagebox.showerror("rec2mp4 — preview unavailable",
+                                 "The frame preview draws with Pillow — "
+                                 + pillow_hint())
+            return
+        item = self.model.items[idx]
+        self._cancel.clear()
+        self.btn_convert.configure(state="disabled")
+        self.btn_preview.configure(state="disabled")
+        self.progress.configure(
+            text=f"previewing {item.path.name} — booting the emulator…")
+        try:
+            count = max(1, int(float(self.var_prev_count.get() or
+                                     PREVIEW_COUNT)))
+            every = max(0.1, float(self.var_prev_every.get() or
+                                   PREVIEW_SPACING_SECONDS))
+        except (TypeError, ValueError):
+            count, every = PREVIEW_COUNT, PREVIEW_SPACING_SECONDS
+        self._worker = threading.Thread(
+            target=self._preview_main,
+            args=(idx, item.path, settings, count, every), daemon=True)
+        self._worker.start()
+
+    def _preview_main(self, idx, path, settings, count=PREVIEW_COUNT,
+                      every=PREVIEW_SPACING_SECONDS):
+        """Worker thread for the preview (widgets are off-limits here)."""
+        put = self._msgq.put
+        try:
+            ctx = load_context(settings,
+                               log=lambda m: put(("blog", str(m))),
+                               err=lambda m: put(("blog", f"! {m}")))
+            res = preview_frames(
+                path, settings, ctx=ctx, count=count, spacing_seconds=every,
+                log=lambda m: put(("log", idx, str(m))),
+                err=lambda m: put(("log", idx, f"! {m}")),
+                progress_cb=lambda p: put(("progress", idx, p)))
+        except PipelineError as exc:
+            res = {"status": "FAILED", "frames": [], "detail": str(exc),
+                   "error": str(exc), "name": Path(path).name}
+        except Exception as exc:
+            res = {"status": "FAILED", "frames": [],
+                   "detail": f"{type(exc).__name__}: {exc}",
+                   "error": str(exc), "name": Path(path).name}
+        put(("preview", idx, res))
+
+    def _show_preview(self, idx, res):
+        self.btn_convert.configure(state="normal")
+        self.btn_preview.configure(state="normal")
+        if res.get("status") != "OK":
+            self.progress.configure(text=f"preview failed: {res['detail']}")
+            messagebox.showerror("rec2mp4 — preview failed",
+                                 str(res.get("detail") or "unknown error"))
+            return
+        frames = res["frames"]
+        self._preview_frames = frames          # the designer reuses frame 0
+        name = self.model.items[idx].path.name if 0 <= idx < len(
+            self.model.items) else res.get("name", "preview")
+        self.progress.configure(
+            text=f"preview: {len(frames)} frame(s) from {name}")
+        PreviewWindow(self.root, frames, name, outdir=self.var_outdir.get())
+
+    # ---- panel designer ----------------------------------------------------
+
+    def _design_sample(self):
+        """(info, extras, game_img) for the designer's live preview.
+
+        Prefers the selected/first queued record + the ROM from the form, so
+        what you design against is your own battle; falls back to the
+        designer's synthetic demo record.
+        """
+        from . import designer as designer_mod
+        rom_bytes = None
+        rom_path = Path(self.var_rom.get().strip() or DEFAULT_ROM)
+        try:
+            if rom_path.is_file():
+                rom_bytes = rom_path.read_bytes()
+        except OSError:
+            rom_bytes = None
+        sections = [s for s in PANEL_SECTIONS if self.var_sections[s].get()]
+        extras = designer_mod.demo_extras(rom_bytes, sections=sections)
+        info = None
+        idx = self._preview_target()
+        if idx is not None and self.model.items[idx].valid:
+            from .pipeline import opponent_label
+            info = self.model.items[idx].info
+            extras["opponent_a_label"] = opponent_label(info, "a", rom_bytes)
+            extras["opponent_b_label"] = opponent_label(info, "b", rom_bytes)
+            extras["outcome_text"] = "unknown"
+            extras["duration_seconds"] = None
+            extras["streak"] = None
+        game_img = None
+        frames = getattr(self, "_preview_frames", None)
+        if frames and pillow_available():
+            # The intro-card frame carries no game_png — design over a real
+            # battle frame, never over the card.
+            real = next((f for f in frames if f.get("game_png")), None)
+            try:
+                import io as _io
+
+                from PIL import Image
+                if real is not None:
+                    game_img = Image.open(_io.BytesIO(real["game_png"]))
+                    game_img.load()
+            except Exception:
+                game_img = None
+        return info or designer_mod.demo_info(), extras, game_img
+
+    def _on_design(self):
+        """Open the visual panel designer on the current layout."""
+        from . import designer as designer_mod
+        from . import layout as layout_mod
+        current = self.var_layout.get().strip()
+        lay = None
+        if current:
+            try:
+                lay = layout_mod.Layout.load(current)
+            except layout_mod.LayoutError as exc:
+                if not messagebox.askyesno(
+                        "rec2mp4 designer",
+                        f"{current} could not be loaded:\n{exc}\n\n"
+                        "Start from a fresh default layout?"):
+                    return
+        if lay is None:
+            side = self.var_panel.get()
+            lay = layout_mod.default_layout(
+                side if side in PANEL_SIDES else "right",
+                sections=[s for s in PANEL_SECTIONS
+                          if self.var_sections[s].get()])
+        info, extras, game_img = self._design_sample()
+
+        def on_apply(new_layout, path):
+            if path:
+                self.var_layout.set(str(path))
+                self.progress.configure(text=f"layout applied: {path}")
+
+        try:                            # a half-typed scale must not crash it
+            scale = max(1, min(4, int(self.var_scale.get() or 3)))
+        except (ValueError, tk.TclError):
+            scale = 3
+        designer_mod.open_designer(
+            self.root, lay, info=info, extras=extras, game_img=game_img,
+            rom_bytes=extras.get("rom_bytes"), on_apply=on_apply,
+            path=(current or None), scale=scale)
 
     def _worker_main(self, jobs, settings):
-        """Worker thread: NEVER touches widgets — messages only."""
+        """Worker thread: NEVER touches widgets — messages only.
+
+        Hands the queue to pipeline.convert_batch, which runs the records
+        either in this process (workers = 1) or one per CPU in separate
+        processes. Every callback just posts a message; the indices are
+        translated from batch position to the model's row index here.
+        """
         put = self._msgq.put
+        rows = [idx for idx, _p in jobs]
+        done = [0]
         try:
             ctx = load_context(settings,
                                log=lambda m: put(("blog", str(m))),
                                err=lambda m: put(("blog", f"! {m}")))
         except PipelineError as exc:
             put(("fatal", str(exc)))
+            put(("done", 0, len(jobs), self._cancel.is_set()))
             return
-        done = 0
         try:
-            for idx, path in jobs:
-                if self._cancel.is_set():
-                    break
-                put(("status", idx, ST_CONVERTING, ""))
-                try:
-                    res = convert_one(
-                        path, settings, ctx=ctx,
-                        log=lambda m, i=idx: put(("log", i, str(m))),
-                        err=lambda m, i=idx: put(("log", i, f"! {m}")),
-                        progress_cb=lambda p, i=idx: put(("progress", i, p)))
-                except Exception as exc:   # convert_one shouldn't raise, but
-                    res = {"status": "FAILED",   # a frozen GUI is worse
-                           "detail": f"{type(exc).__name__}: {exc}"}
-                put(("result", idx, res))
-                done += 1
+            n = resolve_jobs(settings.jobs, len(jobs))
+            if n > 1:
+                put(("blog", f"converting {len(jobs)} record(s) "
+                             f"{n} at a time, one process each"))
+
+            def on_result(k, res):
+                done[0] += 1
+                put(("result", rows[k], res))
+
+            convert_batch(
+                [p for _i, p in jobs], settings, ctx=ctx,
+                log=lambda m: put(("blog", str(m))),
+                err=lambda m: put(("blog", f"! {m}")),
+                on_start=lambda k, _p: put(("status", rows[k],
+                                            ST_CONVERTING, "")),
+                on_log=lambda k, text: put(("log", rows[k], text)),
+                on_progress=lambda k, p: put(("progress", rows[k], p)),
+                on_result=on_result,
+                cancelled=self._cancel.is_set,
+                aborted=self._abort.is_set)
+        except PipelineError as exc:
+            put(("fatal", str(exc)))
+        except Exception as exc:              # a frozen GUI is worse
+            put(("blog", f"! batch failed: {type(exc).__name__}: {exc}"))
         finally:
-            # Always posted, even if the loop itself blows up — 'done' is
+            # Always posted, even if the batch itself blows up — 'done' is
             # what re-enables the Convert button.
-            put(("done", done, len(jobs), self._cancel.is_set()))
+            put(("done", done[0], len(jobs), self._cancel.is_set()))
 
     # ---- main-thread message pump ------------------------------------------
 
@@ -814,18 +1411,23 @@ class GuiApp:
         if kind == "status":
             _, idx, status, detail = msg
             item = self.model.items[idx]
-            item.status, item.detail = status, detail
+            item.status = status
+            item.detail = detail or ("starting…" if status == ST_CONVERTING
+                                     else "")
             self._update_row(idx)
             if status == ST_CONVERTING:
-                self.progress.configure(
-                    text=f"converting {item.path.name}…")
+                self._batch_running.add(idx)
+                self._refresh_batch_line()
         elif kind == "log":
             _, idx, text = msg
-            self.model.items[idx].log_lines.append(text)
-            first = text.strip().splitlines()[0] if text.strip() else ""
-            if first:
-                self.progress.configure(
-                    text=f"{self.model.items[idx].path.name}: {first}")
+            item = self.model.items[idx]
+            item.log_lines.append(text)
+            line = compact_detail(text)
+            if line:
+                # Live progress belongs on the record's OWN row; the final
+                # result overwrites it when the conversion finishes.
+                item.detail = line
+                self._update_row(idx)
         elif kind == "blog":                       # batch-level log line
             text = str(msg[1])
             # err() prefixes batch warnings with "! " (see _worker_main):
@@ -838,15 +1440,30 @@ class GuiApp:
             self.progress.configure(text=text.lstrip("! ").splitlines()[0])
         elif kind == "progress":
             _, idx, p = msg
-            self.progress.configure(
-                text=f"{self.model.items[idx].path.name}: replay "
-                     f"{p.get('frames', 0)} frames "
-                     f"({p.get('seconds', 0.0):.1f}s captured)")
+            item = self.model.items[idx]
+            if p.get("phase") == "preview":
+                item.detail = (f"preview {p.get('grabbed', 0)}"
+                               f"/{p.get('wanted', 0)} frames "
+                               f"({p.get('seconds', 0.0):.1f}s in)")
+            else:
+                item.detail = (f"replay {p.get('frames', 0)}f "
+                               f"{p.get('seconds', 0.0):.1f}s captured")
+            self._update_row(idx)
+        elif kind == "preview":
+            _, idx, res = msg
+            self._show_preview(idx, res)
         elif kind == "result":
             _, idx, res = msg
             item = self.model.items[idx]
             item.status, item.detail = format_result_status(res)
+            item.outcome = (res.get("outcome_text") or "").upper() \
+                if res.get("outcome_text") not in (None, "unknown") else ""
+            if res.get("streak") is not None:
+                item.streak = res["streak"]
             self._update_row(idx)
+            self._batch_running.discard(idx)
+            self._batch_done += 1
+            self._refresh_batch_line()
         elif kind == "fatal":
             self._finish(f"error: {msg[1].splitlines()[0]}")
             messagebox.showerror("rec2mp4 — cannot convert", msg[1])
@@ -858,9 +1475,16 @@ class GuiApp:
                 text += f" (cancelled, {total - done} left in queue)"
             self._finish(text)
 
+    def _refresh_batch_line(self) -> None:
+        self.progress.configure(text=batch_status(
+            self._batch_total, self._batch_done, len(self._batch_running),
+            cancelling=self._cancel.is_set()))
+
     def _finish(self, text):
         self.btn_convert.configure(state="normal")
+        self.btn_preview.configure(state="normal")
         self.btn_cancel.configure(state="disabled")
+        self.btn_cancel_all.configure(state="disabled")
         self.progress.configure(text=text)
 
     # ---- details popup -------------------------------------------------------
@@ -893,6 +1517,11 @@ class GuiApp:
 
 
 def main(argv=None) -> int:                            # noqa: ARG001
+    # A frozen build (PyInstaller/py2app) re-runs the entry module in every
+    # spawned worker; without this the parallel batch would start whole new
+    # GUIs instead of conversion workers. A no-op when not frozen.
+    import multiprocessing
+    multiprocessing.freeze_support()
     if tk is None:
         print("error: tkinter is not available in this Python — install "
               "the Tk support package for your Python (python.org and "
@@ -909,7 +1538,17 @@ def main(argv=None) -> int:                            # noqa: ARG001
     except tk.TclError as exc:
         print(f"error: cannot open a display ({exc})", file=sys.stderr)
         return 2
-    GuiApp(root)
+    app = GuiApp(root)
+    root.protocol("WM_DELETE_WINDOW",
+                  lambda: (save_form(app.read_form()), root.destroy()))
+    # Launched by double-clicking an icon, Tk often comes up BEHIND whatever
+    # was in front. Raise once, then drop topmost so it behaves normally.
+    try:
+        root.lift()
+        root.attributes("-topmost", True)
+        root.after(300, lambda: root.attributes("-topmost", False))
+    except tk.TclError:                                # pragma: no cover
+        pass
     root.mainloop()
     return 0
 

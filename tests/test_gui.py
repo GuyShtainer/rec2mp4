@@ -219,19 +219,43 @@ def test_row_formatting():
         p.write_bytes(good)
         item = gui.load_item(p)
         row = gui.item_row(item)
-        ok(row[0] == "x.rec", f"file col: {row[0]!r}")
-        ok(row[1] == info["facility"] and row[2] == info["level_mode"],
-           f"facility/level cols: {row[1:3]}")
-        ok(row[5] == "ok" and row[6] == gui.ST_WAITING,
-           f"valid/status cols: {row[5:7]}")
+        # Look the columns up by NAME: a row is only meaningful next to
+        # _COLUMNS, and hard-coded indices break the moment one is added.
+        col = {name: i for i, (name, _w) in enumerate(gui._COLUMNS)}
+        ok(len(row) == len(gui._COLUMNS),
+           f"row has {len(row)} cells for {len(gui._COLUMNS)} columns")
+        ok(row[col["file"]] == "x.rec", f"file col: {row[col['file']]!r}")
+        ok(row[col["facility"]] == info["facility"]
+           and row[col["level"]] == info["level_mode"],
+           f"facility/level cols: {row[col['facility']]}, {row[col['level']]}")
+        ok(row[col["valid"]] == "ok" and row[col["status"]] == gui.ST_WAITING,
+           f"valid/status cols: {row[col['valid']]}, {row[col['status']]}")
+        ok(row[col["streak"]] == "" and row[col["outcome"]] == "",
+           "a freshly added record knows neither streak nor outcome yet")
+
+        # A PokeDNA streak-aware stem fills the streak column at ADD time,
+        # before any emulator has run.
+        q = Path(td) / "GUYA_Dome-O-17_27-07-2026_10-40.rec"
+        q.write_bytes(good)
+        item2 = gui.load_item(q)
+        ok(item2.streak == 17, f"streak not read from the stem: {item2.streak}")
+        ok(gui.item_row(item2)[col["streak"]] == "17",
+           "the streak column is empty for a stem that carries one")
+        item2.outcome = "WON"
+        ok(gui.item_row(item2)[col["outcome"]] == "WON",
+           "the outcome column does not show the outcome")
         # opponent column shows the parse's name without any ROM
-        ok(row[4] == gui.item_opponent(info) and row[4] not in ("", "?"),
-           f"opponent col: {row[4]!r}")
+        ok(row[col["opponent"]] == gui.item_opponent(info)
+           and row[col["opponent"]] not in ("", "?"),
+           f"opponent col: {row[col['opponent']]!r}")
         # missing file -> read error row, never an exception
         gone = gui.load_item(Path(td) / "missing.rec")
         ok(gone.read_error and gone.status == gui.ST_FAILED,
            "missing file must be a FAILED read-error item")
-        ok(gui.item_row(gone)[5] == "unreadable", "unreadable marker missing")
+        gone_row = gui.item_row(gone)
+        ok(len(gone_row) == len(gui._COLUMNS),
+           "an unreadable row must still fill every column")
+        ok(gone_row[col["valid"]] == "unreadable", "unreadable marker missing")
     # kind precedence mirrors pipeline naming: multi > two-opponents >
     # double > link > single
     ok(gui.item_kind({"is_multi": True, "is_double": True}) == "multi",
@@ -338,7 +362,28 @@ def test_widget_smoke():
     print("   window built, queue filled, settings read back")
 
 
+def test_detail_line_helpers():
+    print("-- compact_detail / batch_status (the Details column)")
+    ok(gui.compact_detail("    [driver] [f1234] battle running")
+       == "battle running",
+       f"driver scaffolding not stripped: "
+       f"{gui.compact_detail('    [driver] [f1234] battle running')!r}")
+    ok(gui.compact_detail("! panel failed (X) — video kept")
+       .startswith("panel failed"), "the stderr marker must be stripped")
+    ok(gui.compact_detail("one\ntwo") == "one", "only the first line")
+    ok(gui.compact_detail("") == "", "empty stays empty")
+    long = gui.compact_detail("x" * 300)
+    ok(len(long) <= 78 and long.endswith("…"), f"not truncated: {len(long)}")
+
+    ok(gui.batch_status(10, 3, 2) == "3/10 done · 2 converting",
+       gui.batch_status(10, 3, 2))
+    ok(gui.batch_status(10, 10, 0) == "10/10 done", "idle form")
+    ok("cancelling" in gui.batch_status(10, 3, 2, cancelling=True),
+       "a cancelling batch must say so")
+
+
 def main():
+    test_detail_line_helpers()
     test_settings_defaults()
     test_settings_marshalling()
     test_settings_cycle()

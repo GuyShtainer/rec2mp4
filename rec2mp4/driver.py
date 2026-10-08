@@ -95,6 +95,14 @@ class _GlobalTimeout(Exception):
     """max_seconds of emulated time exceeded."""
 
 
+class _CaptureLimit(Exception):
+    """capture_limit frames were captured — a preview run stops here."""
+
+
+class _Aborted(Exception):
+    """The caller asked to stop NOW (Cancel all)."""
+
+
 class EmulatorDriver:
     """Boot the ROM with an injected save and play back the recorded battle.
 
@@ -117,6 +125,8 @@ class EmulatorDriver:
         self._on_frame = None
         self._on_audio = None
         self._max_frames = 0
+        self._capture_limit = None
+        self._should_abort = None
         self._preview_warned = False
         self._preview_logged = False
 
@@ -214,17 +224,32 @@ class EmulatorDriver:
     # public API
     # ------------------------------------------------------------------ #
 
-    def run_replay(self, on_frame, on_audio, max_seconds: int = 1800) -> ReplayResult:
+    def run_replay(self, on_frame, on_audio, max_seconds: int = 1800,
+                   capture_limit: int | None = None,
+                   should_abort=None) -> ReplayResult:
         """Drive menus to the recorded battle, stream ONLY replay frames/audio.
 
         on_frame(frame: bytes)  — one 240x160 RGBX frame (153,600 bytes)
         on_audio(pcm: bytes)    — interleaved stereo s16le at 32,768 Hz
+        capture_limit           — stop cleanly after this many CAPTURED frames
+                                  (end_reason 'preview'); None = run to the end.
+                                  Used by the frame preview, which only needs
+                                  the first seconds of the battle.
+        should_abort()          — polled a few times a second; True stops the
+                                  replay at once (end_reason 'cancelled') so
+                                  "Cancel all" does not have to wait out a
+                                  five-minute battle. Cooperative on purpose:
+                                  the writer still closes and the temp files
+                                  still get cleaned up.
         """
         if self._core is None:
             raise RuntimeError("driver is closed")
         self._on_frame = on_frame
         self._on_audio = on_audio
         self._max_frames = max(1, int(max_seconds * S.FRAME_RATE))
+        self._capture_limit = (int(capture_limit)
+                               if capture_limit and capture_limit > 0 else None)
+        self._should_abort = should_abort
         self._capturing = False
         self._captured = 0
         self._outcome = 0
@@ -248,6 +273,13 @@ class EmulatorDriver:
             # yields a complete, watchable video up to the battle's real end —
             # distinct from a menu stall or the global timeout.
             end_reason = "trimmed" if self._end_trimmed else "natural"
+        except _Aborted:
+            self._log(f"[f{self._frames_run}] aborted by the caller")
+            end_reason = "cancelled"
+        except _CaptureLimit:
+            self._log(f"[f{self._frames_run}] capture limit "
+                      f"{self._capture_limit} reached — stopping (preview)")
+            end_reason = "preview"
         except _StepStall as exc:
             self._log(f"ERROR: {exc}")
             end_reason = f"error:{exc.step}"
@@ -302,6 +334,11 @@ class EmulatorDriver:
             raise _GlobalTimeout()
         core = self._core
         # set_keys takes bit INDICES positionally; raw= is the bitmask form.
+        # Cheap: a callable check every 16 frames is ~4 Hz of emulated time,
+        # far below anything measurable, and makes Cancel all feel instant.
+        if (self._should_abort is not None and self._frames_run % 16 == 0
+                and self._should_abort()):
+            raise _Aborted()
         core.set_keys(raw=keys)
         core.run_frame()
         self._frames_run += 1
@@ -311,6 +348,9 @@ class EmulatorDriver:
                 # 240*160*4 bytes, R,G,B,X order (ffmpeg -pix_fmt rgb0).
                 self._on_frame(bytes(self._ffi.buffer(self._screen.buffer)))
             self._captured += 1
+            if (self._capture_limit is not None
+                    and self._captured >= self._capture_limit):
+                raise _CaptureLimit()
         if self._headed and self._frames_run % 60 == 0:
             self._write_preview()
 

@@ -547,8 +547,10 @@ def test_pipeline_no_emulator():
         # actually composited (INVALID never gets that far).
         ok("panel_applied" in res and res["panel_applied"] is None,
            f"panel_applied must default None: {res.get('panel_applied')!r}")
-        ok(logs and logs[0] == "invalid record — skipping:",
-           f"log lines wrong: {logs[:2]}")
+        # load_context announces the panel layout first, so look for the
+        # rejection line rather than pinning it to index 0.
+        ok("invalid record — skipping:" in logs,
+           f"log lines wrong: {logs[:3]}")
         ok(not errs, f"INVALID must not write to err: {errs}")
 
         # unreadable path -> FAILED via err

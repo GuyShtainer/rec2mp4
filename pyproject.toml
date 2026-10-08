@@ -14,6 +14,7 @@ rec2mp4 = "rec2mp4.__main__:main"
 
 [project.gui-scripts]
 rec2mp4-gui = "rec2mp4.gui:main"
+rec2mp4-designer = "rec2mp4.designer:main"
 
 [tool.setuptools.packages.find]
 include = ["rec2mp4*"]

@@ -28,7 +28,7 @@ from .rec import STAT_KEYS, STAT_LABELS
 # Sections the panel can draw, in draw order. --panel-info picks a subset.
 # The three per-mon stat blocks (moves / evs / ivs) sit right after "teams";
 # they are also the pages the optional time-cycling panel flips through.
-PANEL_SECTIONS = ("header", "players", "opponents", "teams",
+PANEL_SECTIONS = ("header", "players", "trainer", "opponents", "teams",
                   "moves", "evs", "ivs", "export", "footer")
 
 # The subset of PANEL_SECTIONS that show decoded per-mon battle stats. These
@@ -128,6 +128,66 @@ def _font(image_font_mod, px: int):
 def _mmss(seconds: float) -> str:
     s = max(0, int(round(seconds)))
     return "%d:%02d" % (s // 60, s % 60)
+
+
+# --- the trainer's save state (PokeDNA's '<stem>.txt' 'state.*' block) -----
+# docs/REC-SIDECAR.md. Every key is optional and a missing key is NEVER shown
+# as a zero: "0 BP" and "this game has no Battle Points" are different facts.
+
+_SYMBOL_COLORS = {"none": (58, 66, 78), "silver": (198, 206, 216),
+                  "gold": (255, 203, 79)}
+
+
+def trainer_lines(info: dict, extras: dict) -> list[tuple]:
+    """Styled rows for the trainer-state section, or [] with no sidecar.
+
+    The 'symbols' row carries the raw 7-character Frontier-Pass string; the
+    renderers draw it as seven pips (Tower..Pyramid) rather than as text.
+    """
+    state = extras.get("state") or {}
+    if not state:
+        return []
+    rows: list[tuple] = []
+    who = (info.get("recorded_by") or "").strip()
+    if who:
+        rows.append((who, "title"))
+    if state.get("playtime"):
+        rows.append(("%s played" % state["playtime"], "body"))
+    if "dex_seen" in state or "dex_caught" in state:
+        parts = []
+        if "dex_seen" in state:
+            parts.append("%d seen" % state["dex_seen"])
+        if "dex_caught" in state:
+            parts.append("%d caught" % state["dex_caught"])
+        rows.append(("Pokedex  " + " / ".join(parts), "body"))
+    if "bp" in state:
+        rows.append(("Battle Points  %d" % state["bp"], "accent"))
+    if state.get("symbols"):
+        rows.append((state["symbols"], "symbols"))
+    return rows
+
+
+def _draw_symbols(draw, text: str, x: int, y: int, width: int, px: int,
+                  colors=None) -> None:
+    """Seven Frontier symbols as pips, in Frontier Pass order, left aligned.
+
+    '-' none (dark), 's' silver, 'G' gold — exactly the encoding in
+    docs/REC-SIDECAR.md, drawn so silver/gold read at a glance.
+    """
+    colors = colors or _SYMBOL_COLORS
+    n = max(1, len(text))
+    d = max(3, int(px * 0.9))
+    gap = max(2, int(d * 0.45))
+    total = n * d + (n - 1) * gap
+    if total > width and width > 0:                 # squeeze to fit the box
+        d = max(3, int((width - (n - 1) * 2) / n))
+        gap = 2
+    for i, ch in enumerate(text):
+        kind = {"s": "silver", "G": "gold"}.get(ch, "none")
+        cx = x + i * (d + gap)
+        draw.ellipse([cx, y, cx + d, y + d],
+                     fill=colors.get(kind, colors["none"]),
+                     outline=(90, 100, 115) if kind == "none" else None)
 
 
 def _mon_display_name(mon: dict, rom_bytes) -> tuple[str, str | None]:
@@ -335,6 +395,25 @@ def render_panel(info: dict, extras: dict, size: tuple[int, int]) -> bytes:
             line("With " + ", ".join(players), f_small, px_small, _DIM)
         rule()
 
+    # ---------------------------------------------- trainer (save state)
+    if "trainer" in sections:
+        rows = trainer_lines(info, extras)
+        for text, role in rows:
+            if role == "symbols":
+                step = int(px_body * 1.45)
+                if y + step > y_limit:
+                    break
+                _draw_symbols(draw, text, margin, y, max_w, px_body)
+                y += step
+            elif role == "title":
+                continue                    # the players line already names them
+            else:
+                colour = _GOLD if role == "accent" else _FG
+                if not line(text, f_small, px_small, colour):
+                    break
+        if rows:
+            rule()
+
     # -------------------------------------------------------- opponents
     if "opponents" in sections:
         opp_a = (extras.get("opponent_a_label")
@@ -467,6 +546,666 @@ def render_panel(info: dict, extras: dict, size: tuple[int, int]) -> bytes:
         draw.text((margin, fy),
                   ellipsize("seed %s" % info.get("rng_seed", "?"), f_small),
                   font=f_small, fill=_DIM)
+
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+# ===========================================================================
+# Free-form block rendering (rec2mp4.layout) — the designer's renderer
+# ===========================================================================
+#
+# render_panel() above is the classic fixed vertical flow. Everything below
+# draws the SAME content into user-placed rectangles ("information windows")
+# described by a rec2mp4.layout.PanelSpec: any side (left/right/top/bottom),
+# per-block fonts/colours/backgrounds, an optional background image. The two
+# renderers share the data (`stat_page_lines`) but not the geometry, so the
+# classic panel's output is untouched by anything here.
+
+# role -> (relative size, colour key). The colour keys resolve against a
+# theme dict built per block (so a block can override body/title/accent).
+_ROLE_STYLE = {
+    "head":        (1.55, "fg"),
+    "sub":         (1.00, "dim"),
+    "accent":      (1.00, "accent"),
+    "warn":        (0.85, "warn"),
+    "body":        (1.00, "fg"),
+    "small":       (0.80, "dim"),
+    "title":       (0.80, "title"),
+    "mon":         (1.00, "fg"),
+    "mon_shiny":   (1.00, "fg"),
+    "name":        (1.00, "fg"),
+    "moves":       (0.92, "fg"),
+    "namesum":     (1.00, "fg"),
+    "values":      (0.92, "fg"),
+    "unavailable": (0.92, "dim"),
+    "outcome":     (1.20, "outcome"),
+    "symbols":     (1.10, "fg"),
+    "quote":       (1.15, "fg"),
+    "blank":       (0.60, "dim"),
+}
+
+_MIN_BLOCK_PX = 7          # below this nothing is legible — clip instead
+_MAX_BLOCK_PX = 96         # a one-line title block should not fill the screen
+
+
+def _role_style(role: str) -> tuple[float, str]:
+    return _ROLE_STYLE.get(role, (1.0, "fg"))
+
+
+def section_lines(kind: str, info: dict, extras: dict) -> list[tuple]:
+    """Styled rows (text, role) for one block kind — the block renderer's
+    content source. Pure logic, no Pillow; tests assert on it directly.
+
+    Mirrors what render_panel draws for the same section, minus the flow
+    layout's rules/spacing (a block has its own box).
+    """
+    rom_bytes = extras.get("rom_bytes")
+    rows: list[tuple] = []
+
+    if kind in STAT_PAGE_SECTIONS:
+        return stat_page_lines(info, extras, kind)
+
+    if kind == "header":
+        rows.append((info.get("facility", "?"), "head"))
+        kinds = [label for label, key in
+                 (("Double", "is_double"), ("Multi", "is_multi"),
+                  ("Two opponents", "is_two_opponents"),
+                  ("Link", "is_link_recorded")) if info.get(key)]
+        sub = info.get("level_mode", "?")
+        if kinds:
+            sub += " - " + ", ".join(kinds)
+        rows.append((sub, "sub"))
+        streak = extras.get("streak")
+        if streak is not None:
+            rows.append(("Streak %d" % streak, "accent"))
+        if extras.get("pov") == "opponent":
+            rows.append(("Opponent POV (experimental)", "warn"))
+            if not extras.get("pov_faithful"):
+                rows.append(("what-if: replay diverges", "small"))
+        return rows
+
+    if kind == "players":
+        by = info.get("recorded_by") or "?"
+        gender = info.get("recorded_by_gender") or "?"
+        text = "Recorded by %s" % by
+        if gender in ("M", "F"):
+            text += " (%s)" % gender
+        langs = info.get("players_language") or []
+        if langs and info.get("multiplayer_id", 0) == 0:
+            text += ", %s" % langs[0]
+        rows.append((text, "body"))
+        others = [p for p in info.get("players", []) if p and p != by]
+        if others:
+            rows.append(("With " + ", ".join(others), "small"))
+        return rows
+
+    if kind == "trainer":
+        return trainer_lines(info, extras)
+
+    if kind == "opponents":
+        opp_a = (extras.get("opponent_a_label")
+                 or info.get("opponent_a_name")
+                 or "#%s" % info.get("opponent_a", "?"))
+        rows.append(("vs %s" % opp_a, "body"))
+        opp_b = extras.get("opponent_b_label")
+        if opp_b is None and info.get("opponent_b_kind"):
+            opp_b = info.get("opponent_b_name")
+        if opp_b:
+            rows.append(("and %s" % opp_b, "body"))
+        return rows
+
+    if kind == "teams":
+        titles = {"player": (info.get("recorded_by") or "Player").strip()
+                  or "Player", "opponent": "Opponent"}
+        for side in ("player", "opponent"):
+            mons = (info.get("teams") or {}).get(side) or []
+            if not mons:
+                continue
+            rows.append((titles[side].upper(), "title"))
+            for m in mons:
+                species, nick = _mon_display_name(m, rom_bytes)
+                text = species
+                if nick:
+                    text += " (%s)" % nick
+                text += "  Lv%s" % m.get("level", "?")
+                rows.append((text, "mon_shiny" if m.get("shiny") else "mon"))
+        return rows
+
+    if kind == "export":
+        shown = 0
+        for raw in extras.get("export_lines") or []:
+            text = str(raw).strip()
+            if not text or len(text) > _MAX_EXPORT_LINE_CHARS:
+                continue
+            if shown >= _MAX_EXPORT_LINES:
+                break
+            rows.append((text, "small"))
+            shown += 1
+        return rows
+
+    if kind == "footer":
+        outcome = (extras.get("outcome_text") or "unknown").strip()
+        text = outcome.upper()
+        dur = extras.get("duration_seconds")
+        if dur is not None:
+            text += "  -  %s" % _mmss(float(dur))
+        rows.append((text, "outcome"))
+        rows.append(("seed %s" % info.get("rng_seed", "?"), "small"))
+        return rows
+
+    return rows
+
+
+def _block_rows(block, info: dict, extras: dict) -> list[tuple]:
+    """Rows for a block, honouring its own knobs (custom text, no caption)."""
+    kind = getattr(block, "kind", "")
+    if kind == "text":
+        text = getattr(block, "text", "") or ""
+        return [(ln, "body") if ln.strip() else ("", "blank")
+                for ln in text.splitlines()] or [("", "blank")]
+    if kind in ("rule", "frame"):
+        return []
+    rows = section_lines(kind, info, extras)
+    if not getattr(block, "title", True):
+        rows = [(t, r) for t, r in rows if r != "title"]
+    return rows
+
+
+def _block_theme(block, extras: dict) -> dict:
+    """Colour table for one block: defaults, then the block's overrides."""
+    from .layout import color_rgb            # local: layout imports panel
+    outcome = (extras.get("outcome_text") or "unknown").strip()
+    theme = {"fg": _FG, "dim": _DIM, "title": _DIM, "accent": _GOLD,
+             "warn": _RED, "outcome": _OUTCOME_COLORS.get(outcome, _DIM)}
+    if getattr(block, "color", None):
+        theme["fg"] = color_rgb(block.color, _FG)
+    if getattr(block, "title_color", None):
+        theme["title"] = theme["dim"] = color_rgb(block.title_color, _DIM)
+    if getattr(block, "accent_color", None):
+        acc = color_rgb(block.accent_color, _GOLD)
+        theme["accent"] = acc
+        # A custom accent also recolours the footer outcome + EV/IV sums, so
+        # one designer control retints every highlight in the block.
+        theme["outcome"] = acc
+        theme["sum"] = acc
+    return theme
+
+
+def _wrap_row(draw, text: str, font, max_w: int) -> list[str]:
+    """Greedy word wrap; a single over-long word is split mid-word."""
+    if max_w <= 0 or not text:
+        return [text]
+    if draw.textlength(text, font=font) <= max_w:
+        return [text]
+    out: list[str] = []
+    line = ""
+    for word in text.split(" "):
+        cand = word if not line else line + " " + word
+        if draw.textlength(cand, font=font) <= max_w or not line:
+            line = cand
+            # a lone word wider than the box: hard-split it
+            while draw.textlength(line, font=font) > max_w and len(line) > 1:
+                cut = len(line) - 1
+                while cut > 1 and draw.textlength(line[:cut],
+                                                  font=font) > max_w:
+                    cut -= 1
+                out.append(line[:cut])
+                line = line[cut:]
+        else:
+            out.append(line)
+            line = word
+    if line:
+        out.append(line)
+    return out
+
+
+def _ellipsize(draw, text: str, font, max_w: int) -> str:
+    if max_w <= 0 or draw.textlength(text, font=font) <= max_w:
+        return text
+    while text and draw.textlength(text + "...", font=font) > max_w:
+        text = text[:-1]
+    return text + "..."
+
+
+def _fit_block(draw, ImageFont, rows: list[tuple], inner: tuple,
+               block) -> tuple:
+    """Choose the font size for a block and lay its rows out.
+
+    Returns (font_px, laid_rows) where laid_rows is [(text, role, font)] —
+    already wrapped when block.wrap is set. The size starts from "fill the
+    box vertically" (so text grows with the rectangle, which is what a
+    drag-to-resize designer should do), is then scaled by block.font_scale,
+    and finally shrunk until it fits when block.fit == 'shrink'.
+    """
+    inner_w, inner_h = inner
+    gap = float(getattr(block, "line_gap", 1.45)) or 1.45
+    scale = float(getattr(block, "font_scale", 1.0) or 1.0)
+    wrap = bool(getattr(block, "wrap", False))
+    shrink = getattr(block, "fit", "shrink") != "clip"
+    if not rows:
+        return 0, []
+
+    def weight(rs):
+        return sum(_role_style(r)[0] for _t, r in rs) or 1.0
+
+    px = int(inner_h / (gap * weight(rows)))
+    px = max(_MIN_BLOCK_PX, min(_MAX_BLOCK_PX, px))
+    px = max(_MIN_BLOCK_PX, min(_MAX_BLOCK_PX, int(round(px * scale))))
+
+    laid: list[tuple] = []
+    for _ in range(8):
+        font_cache: dict[float, object] = {}
+
+        def font_for(rel, _cache=font_cache, _px=px):
+            key = round(rel, 3)
+            if key not in _cache:
+                _cache[key] = _font(ImageFont,
+                                    max(_MIN_BLOCK_PX, int(round(_px * rel))))
+            return _cache[key]
+
+        laid = []
+        for text, role in rows:
+            rel = _role_style(role)[0]
+            fnt = font_for(rel)
+            if wrap and text:
+                for piece in _wrap_row(draw, text, fnt, inner_w):
+                    laid.append((piece, role, fnt))
+            else:
+                laid.append((text, role, fnt))
+        need = sum(gap * px * _role_style(r)[0] for _t, r, _f in laid)
+        too_wide = 0
+        if not wrap:
+            for text, role, fnt in laid:
+                if text:
+                    too_wide = max(too_wide,
+                                   int(draw.textlength(text, font=fnt)))
+        if not shrink:
+            break
+        over_h = need > inner_h
+        over_w = too_wide > inner_w > 0
+        if not over_h and not over_w:
+            break
+        if px <= _MIN_BLOCK_PX:
+            break
+        factor = 1.0
+        if over_h:
+            factor = min(factor, inner_h / need)
+        if over_w:
+            factor = min(factor, inner_w / too_wide)
+        nxt = int(px * factor)
+        px = max(_MIN_BLOCK_PX, min(px - 1, nxt))
+    return px, laid
+
+
+def _load_background(Image, spec, size: tuple, warn=None):
+    """Panel background: solid colour, optionally an image on top of it."""
+    from .layout import color_rgb
+    w, h = size
+    base = Image.new("RGB", (w, h), color_rgb(getattr(spec, "bg", None),
+                                              _BG))
+    path = getattr(spec, "bg_image", None)
+    if not path:
+        return base
+    try:
+        src = Image.open(path)
+        src.load()
+        src = src.convert("RGB")
+    except Exception as exc:                       # missing / not an image
+        if warn:
+            warn("panel background image unusable (%s): %s"
+                 % (path, type(exc).__name__))
+        return base
+    mode = getattr(spec, "bg_mode", "cover")
+    layer = Image.new("RGB", (w, h), color_rgb(getattr(spec, "bg", None), _BG))
+    sw, sh = src.size
+    if sw <= 0 or sh <= 0:
+        return base
+    if mode == "stretch":
+        layer = src.resize((w, h))
+    elif mode == "tile":
+        for oy in range(0, h, sh):
+            for ox in range(0, w, sw):
+                layer.paste(src, (ox, oy))
+    elif mode == "center":
+        layer.paste(src, ((w - sw) // 2, (h - sh) // 2))
+    else:                                          # cover / contain
+        ratio = max(w / sw, h / sh) if mode == "cover" else min(w / sw, h / sh)
+        nw, nh = max(1, int(round(sw * ratio))), max(1, int(round(sh * ratio)))
+        resized = src.resize((nw, nh))
+        layer.paste(resized, ((w - nw) // 2, (h - nh) // 2))
+
+    dim = float(getattr(spec, "bg_dim", 0.0) or 0.0)
+    if dim > 0:
+        black = Image.new("RGB", (w, h), (0, 0, 0))
+        layer = Image.blend(layer, black, min(1.0, dim))
+    opacity = float(getattr(spec, "bg_opacity", 1.0))
+    if opacity >= 1.0:
+        return layer
+    if opacity <= 0.0:
+        return base
+    return Image.blend(base, layer, opacity)
+
+
+def render_layout_panel_image(info: dict, extras: dict, spec,
+                              size: tuple[int, int], warn=None):
+    """Render one PanelSpec to a PIL Image (RGB). See render_layout_panel."""
+    Image, ImageDraw, ImageFont = _require_pil()
+    from .layout import PanelSpec, color_rgb
+    if isinstance(spec, dict):
+        spec = PanelSpec.from_dict(spec)
+
+    w, h = int(size[0]), int(size[1])
+    if w < 16 or h < 16:
+        raise ValueError("panel size %dx%d too small to render" % (w, h))
+
+    img = _load_background(Image, spec, (w, h), warn=warn)
+    draw = ImageDraw.Draw(img)
+
+    for block in getattr(spec, "blocks", []):
+        if not getattr(block, "visible", True):
+            continue
+        left, top, right, bottom = block.rect_px((w, h))
+        bw, bh = right - left, bottom - top
+        if bw < 4 or bh < 4:
+            continue
+
+        # ---- block background / border
+        radius = int(getattr(block, "radius", 0) or 0)
+        bg = getattr(block, "bg", None)
+        border = getattr(block, "border", None)
+        bwidth = int(getattr(block, "border_width", 1) or 0)
+        if bg:
+            alpha = int(round(255 * float(getattr(block, "bg_opacity", 1.0))))
+            if alpha > 0:
+                overlay = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
+                od = ImageDraw.Draw(overlay)
+                fill = color_rgb(bg, _BG) + (alpha,)
+                if radius > 0:
+                    od.rounded_rectangle([0, 0, bw - 1, bh - 1],
+                                         radius=min(radius, bw // 2, bh // 2),
+                                         fill=fill)
+                else:
+                    od.rectangle([0, 0, bw - 1, bh - 1], fill=fill)
+                img.paste(Image.alpha_composite(
+                    img.crop((left, top, right, bottom)).convert("RGBA"),
+                    overlay).convert("RGB"), (left, top))
+        if border and bwidth > 0:
+            box = [left, top, right - 1, bottom - 1]
+            if radius > 0:
+                draw.rounded_rectangle(
+                    box, radius=min(radius, bw // 2, bh // 2),
+                    outline=color_rgb(border, _RULE), width=bwidth)
+            else:
+                draw.rectangle(box, outline=color_rgb(border, _RULE),
+                               width=bwidth)
+
+        if block.kind == "frame":
+            continue
+        if block.kind == "rule":
+            col = color_rgb(getattr(block, "color", None) or "", _RULE) \
+                if getattr(block, "color", None) else _RULE
+            ry = top + bh // 2
+            pad = int(bw * float(getattr(block, "padding", 0.03)))
+            draw.line([(left + pad, ry), (right - pad, ry)], fill=col,
+                      width=max(1, bwidth))
+            continue
+
+        rows = _block_rows(block, info, extras)
+        if not rows:
+            continue
+        pad_x = int(bw * float(getattr(block, "padding", 0.03)))
+        pad_y = max(1, pad_x // 2)
+        inner_w = max(1, bw - 2 * pad_x)
+        inner_h = max(1, bh - 2 * pad_y)
+        px, laid = _fit_block(draw, ImageFont, rows, (inner_w, inner_h), block)
+        if not laid:
+            continue
+
+        theme = _block_theme(block, extras)
+        gap = float(getattr(block, "line_gap", 1.45)) or 1.45
+        total = sum(gap * px * _role_style(r)[0] for _t, r, _f in laid)
+        valign = getattr(block, "valign", "top")
+        if valign == "middle":
+            y = top + pad_y + max(0, (inner_h - total) / 2.0)
+        elif valign == "bottom":
+            y = top + pad_y + max(0, inner_h - total)
+        else:
+            y = top + pad_y
+        align = getattr(block, "align", "left")
+        x_left, x_right = left + pad_x, right - pad_x
+
+        drawn = 0
+        for text, role, fnt in laid:
+            rel = _role_style(role)[0]
+            step = gap * px * rel
+            if y + step > bottom - pad_y + 1:
+                break                              # hard clip at the box edge
+            drawn += 1
+            if role == "symbols" and text:
+                # Frontier symbols are pips, not characters (REC-SIDECAR.md).
+                _draw_symbols(draw, text, x_left, int(y), inner_w,
+                              int(px * rel))
+                y += step
+                continue
+            if text:
+                shown = text if getattr(block, "wrap", False) \
+                    else _ellipsize(draw, text, fnt, inner_w)
+                colour = theme.get(_role_style(role)[1], _FG)
+                tw = int(draw.textlength(shown, font=fnt))
+                if align == "center":
+                    tx = x_left + max(0, (inner_w - tw) // 2)
+                elif align == "right":
+                    tx = max(x_left, x_right - tw)
+                else:
+                    tx = x_left
+                if role == "namesum":
+                    # "<name>  Sum NNN/510": name left, sum right in the
+                    # accent colour (matches the classic panel's emphasis).
+                    idx = text.find("  Sum ")
+                    if idx >= 0:
+                        name_part, sum_part = text[:idx], text[idx + 2:]
+                        sum_w = int(draw.textlength(sum_part, font=fnt))
+                        budget = max(0, inner_w - sum_w - int(px * 0.5))
+                        draw.text((x_left, y),
+                                  _ellipsize(draw, name_part, fnt, budget),
+                                  font=fnt, fill=colour)
+                        acc = theme.get("sum") or (
+                            _GOLD if "PERFECT" in sum_part else _GREEN)
+                        draw.text((x_right - sum_w, y), sum_part, font=fnt,
+                                  fill=acc)
+                        y += step
+                        continue
+                draw.text((tx, y), shown, font=fnt, fill=colour)
+                if role == "mon_shiny":
+                    draw.text((min(x_right - int(px * 0.6), tx + tw
+                                   + int(px * 0.4)), y),
+                              "*", font=fnt, fill=theme.get("accent", _GOLD))
+            y += step
+
+        # A block too small for its content must SAY so — silent truncation
+        # is exactly how the old fixed-height panel hid half a team.
+        if drawn < len(laid):
+            mark = "+%d" % (len(laid) - drawn)
+            mfont = _font(ImageFont, max(_MIN_BLOCK_PX, int(px * 0.8)))
+            mw = int(draw.textlength(mark, font=mfont))
+            draw.text((max(left, right - pad_x - mw),
+                       bottom - pad_y - int(px * 0.9)), mark, font=mfont,
+                      fill=theme.get("accent", _GOLD))
+
+    return img
+
+
+def render_layout_panel(info: dict, extras: dict, spec,
+                        size: tuple[int, int], warn=None) -> bytes:
+    """Render one PanelSpec (or its dict form) to PNG bytes.
+
+    info/extras are exactly what render_panel takes; `spec` is a
+    rec2mp4.layout.PanelSpec; `size` is the panel's pixel size from
+    Layout.panel_size_px(). `warn(str)` (optional) receives non-fatal
+    problems — currently an unusable background image, which degrades to
+    the solid background colour instead of failing the conversion.
+    """
+    img = render_layout_panel_image(info, extras, spec, size, warn=warn)
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def render_layout_pages(info: dict, extras: dict, specs, size,
+                        warn=None) -> list[bytes]:
+    """Render a panel's page list (layout.panel_page_specs) to PNG bytes."""
+    return [render_layout_panel(info, extras, s, size, warn=warn)
+            for s in specs]
+
+
+# ---------------------------------------------------------------------------
+# End card — the trainer's save state, held for the last seconds of the video
+# ---------------------------------------------------------------------------
+
+# One letter per facility, Frontier Pass order (matches state.symbols):
+# Tower, Dome, Palace, Arena, Factory, Pike, Pyramid.
+FACILITY_LABELS = ("T", "D", "P", "A", "F", "K", "Y")
+
+
+def end_card_lines(info: dict, extras: dict) -> list[tuple]:
+    """Rows for the end card: who this is, then their save state.
+
+    Empty when there is no 'state.*' sidecar block — a video then simply ends
+    where it always did (docs/REC-SIDECAR.md: a missing .txt is not an error).
+    """
+    state = extras.get("state") or {}
+    if not state:
+        return []
+    rows: list[tuple] = []
+    who = (info.get("recorded_by") or "").strip()
+    gender = info.get("recorded_by_gender") or ""
+    if who:
+        rows.append((who + (" (%s)" % gender if gender in ("M", "F") else ""),
+                     "head"))
+    if state.get("playtime"):
+        rows.append(("%s played" % state["playtime"], "body"))
+    if "dex_seen" in state or "dex_caught" in state:
+        parts = []
+        if "dex_seen" in state:
+            parts.append("%d seen" % state["dex_seen"])
+        if "dex_caught" in state:
+            parts.append("%d caught" % state["dex_caught"])
+        rows.append(("Pokedex   " + " / ".join(parts), "body"))
+    if "bp" in state:
+        rows.append(("Battle Points   %d" % state["bp"], "accent"))
+    if state.get("symbols"):
+        rows.append(("Frontier Symbols", "small"))
+        rows.append((state["symbols"], "symbols"))
+    streak = extras.get("streak")
+    if streak is not None:
+        rows.append(("Streak %d" % streak, "accent"))
+    return rows
+
+
+def intro_card_lines(info: dict, extras: dict) -> list[tuple]:
+    """Rows for the opening card: who you are about to fight, and their line.
+
+    The pre-battle taunt is NOT part of the recorded battle (the record starts
+    at the engine's "<TRAINER> would like to battle!"), but it IS in the ROM,
+    keyed by the same opponent id the record carries — see
+    romdata.frontier_trainer_speech. `extras['speech']` carries the decoded
+    words; with none (a record-mix friend / apprentice, whose greeting lives
+    in the SAVE, or a non-Emerald ROM) this returns [] and the caller skips
+    the card entirely.
+    """
+    words = extras.get("speech") or []
+    if not words:
+        return []
+    rows: list[tuple] = []
+    opp = (extras.get("opponent_a_label") or info.get("opponent_a_name")
+           or "").strip()
+    if opp:
+        rows.append(("VS " + opp, "head"))
+    sub = "%s  -  %s" % (info.get("facility", "?"),
+                         info.get("level_mode", "?"))
+    rows.append((sub, "small"))
+    # The game breaks its six easy-chat words after the third; keep that
+    # rhythm so the line reads the way it does in-game.
+    per_line = 3
+    lines = [" ".join(words[i:i + per_line])
+             for i in range(0, len(words), per_line)]
+    for i, text in enumerate(lines):
+        if len(lines) == 1:
+            text = '"%s"' % text
+        elif i == 0:
+            text = '"%s' % text
+        elif i == len(lines) - 1:
+            text = '%s"' % text
+        rows.append((text, "quote"))
+    return rows
+
+
+def render_intro_card(info: dict, extras: dict, size: tuple[int, int],
+                      bg: str | None = None) -> bytes:
+    """The opening card as PNG bytes, sized to the finished video's frame.
+
+    Raises ValueError when there is no speech to show, so the caller can skip
+    the whole stage (exactly like render_end_card).
+    """
+    rows = intro_card_lines(info, extras)
+    if not rows:
+        raise ValueError("no opponent speech to put on an intro card")
+    return _render_card(rows, size, bg)
+
+
+def render_end_card(info: dict, extras: dict, size: tuple[int, int],
+                    bg: str | None = None) -> bytes:
+    """The end card as PNG bytes, sized to the finished video's frame.
+
+    Centred block: trainer, playtime, Pokedex, BP, the seven Frontier symbol
+    pips (Tower..Pyramid) and the streak. Raises ValueError when there is
+    nothing to show, so the caller can skip the whole stage.
+    """
+    rows = end_card_lines(info, extras)
+    if not rows:
+        raise ValueError("no trainer state to put on an end card")
+    return _render_card(rows, size, bg)
+
+
+def _render_card(rows: list[tuple], size: tuple[int, int],
+                 bg: str | None = None) -> bytes:
+    """Draw a full-frame card: centred rows, one shared look for every card."""
+    Image, ImageDraw, ImageFont = _require_pil()
+    from .layout import color_rgb
+
+    w, h = int(size[0]), int(size[1])
+    img = Image.new("RGB", (w, h), color_rgb(bg, _BG) if bg else _BG)
+    draw = ImageDraw.Draw(img)
+
+    px = max(10, min(h // 12, w // 26))
+    gap = 1.6
+    total = sum(px * gap * _role_style(r)[0] for _t, r in rows)
+    y = (h - total) / 2.0
+    x = w * 0.5
+    label_font = _font(ImageFont, max(8, int(px * 0.55)))
+    for text, role in rows:
+        rel, key = _role_style(role)
+        step = px * gap * rel
+        font = _font(ImageFont, max(8, int(px * rel)))
+        if role == "symbols":
+            d = int(px * rel)
+            n = len(text)
+            span = n * d + (n - 1) * max(2, int(d * 0.45))
+            _draw_symbols(draw, text, int(x - span / 2), int(y), span, d)
+            # facility initials under the pips, so the row is self-explaining
+            step_x = d + max(2, int(d * 0.45))
+            for i, name in enumerate(FACILITY_LABELS[:n]):
+                draw.text((x - span / 2 + i * step_x, y + d + 2), name,
+                          font=label_font, fill=_DIM)
+            y += step + px * 0.6
+            continue
+        colour = {"head": _FG, "accent": _GOLD, "small": _DIM,
+                  "dim": _DIM, "quote": _FG}.get(role, _FG)
+        tw = draw.textlength(text, font=font)
+        draw.text((x - tw / 2, y), text, font=font, fill=colour)
+        y += step
 
     buf = io.BytesIO()
     img.save(buf, "PNG")

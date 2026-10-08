@@ -75,7 +75,7 @@ class Mp4Writer:
     """
 
     def __init__(self, out_path, scale=4, audio_rate=32768, audio=True,
-                 log=print, pix_fmt="rgb0"):
+                 log=print, pix_fmt="rgb0", threads=0):
         # Default pix_fmt "rgb0": the mGBA framebuffer is R,G,B,X — the 4th
         # byte is padding, not alpha (verified in emulator-stack.md).
         if pix_fmt not in _ALLOWED_PIX_FMTS:
@@ -96,6 +96,10 @@ class Mp4Writer:
         self._audio = bool(audio)
         self._log = log if log is not None else (lambda *a, **k: None)
         self._pix_fmt = pix_fmt
+        # 0 = let ffmpeg decide (it picks ~1.5x the core count for x264).
+        # A parallel batch MUST cap this: N workers x 55 threads each is how
+        # you turn 12 cores into a context-switching heap.
+        self._threads = max(0, int(threads or 0))
         self._ffmpeg = _find_ffmpeg()
 
         self._frames = 0
@@ -138,6 +142,9 @@ class Mp4Writer:
         ]
         if scale != 1:
             cmd += ["-vf", "scale=iw*%d:ih*%d:flags=neighbor" % (scale, scale)]
+        if self._threads:
+            cmd += ["-threads", str(self._threads),
+                    "-filter_threads", str(self._threads)]
         cmd += [
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
             "-pix_fmt", "yuv420p",
@@ -160,10 +167,12 @@ class Mp4Writer:
             raise RuntimeError("failed to launch ffmpeg (%s): %s"
                                % (self._ffmpeg, exc))
 
-        self._log("[video] encoder started: %dx%d x%d (%s) -> %s%s"
+        self._log("[video] encoder started: %dx%d x%d (%s) -> %s%s%s"
                   % (WIDTH, HEIGHT, scale, pix_fmt, self._out_path,
                      ", audio %d Hz" % audio_rate if self._audio
-                     else ", no audio"))
+                     else ", no audio",
+                     ", %d thread(s)" % self._threads if self._threads
+                     else ""))
 
     # ---------------------------------------------------------------- feed
 
@@ -256,7 +265,10 @@ class Mp4Writer:
                     self._ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                     "-i", self._video_tmp,
                     "-f", "s16le", "-ar", str(self._audio_rate), "-ac", "2",
-                    "-i", self._audio_tmp,
+                    "-i", self._audio_tmp]
+                if self._threads:
+                    cmd += ["-threads", str(self._threads)]
+                cmd += [
                     "-c:v", "copy",
                     "-c:a", "aac", "-b:a", "192k",
                     "-shortest",
