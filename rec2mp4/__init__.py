@@ -9,4 +9,4 @@ replays them in the real engine under mGBA (rec2mp4.driver / rec2mp4.states)
 and encodes the captured frames + audio with ffmpeg (rec2mp4.video).
 """
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"

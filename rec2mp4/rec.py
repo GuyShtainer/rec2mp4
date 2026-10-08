@@ -35,9 +35,9 @@ A .rec is the raw 4096-byte save sector 31 of a US Emerald 128 KiB .sav:
     +3964  checksum u32        plain u32 sum of struct bytes 0..3963
   +0xF84  124 bytes of 0x00 padding
 
-Byte-exact spec (with pokeemerald decomp citations):
-PokeDNA/docs/analysis-2026-07-17/record-spec.md. This module adapts the
-proven parser PokeDNA/tools/read_rec.py (same author, GPL).
+This module adapts PokeDNA's proven record parser (tools/read_rec.py in
+https://github.com/GuyShtainer/PokeDNA, same author, GPL); the byte-exact spec
+with pokeemerald decomp citations lives with that project.
 
 Pure stdlib, Python >= 3.10.
 """

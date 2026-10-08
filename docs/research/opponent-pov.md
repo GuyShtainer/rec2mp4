@@ -18,7 +18,7 @@ possible for genuine link-battle records (bit 25) — a record type this project
   baseline conversion: 3142 frames / 52.6 s, natural end, outcome `won`)
 - Experiments run 2026-07-27 with the shipped, unmodified `rec2mp4.driver` (mGBA headless,
   US Emerald CRC32 1F1C08FB); transform scripts lived in the session scratchpad only.
-- Evidence frames: `docs/research/opponent-pov/*.png` (raw emulator framebuffer captures).
+- Evidence frames: `docs/research/opponent-pov/*.png` (raw emulator framebuffer captures; local in-game captures, not published).
 
 ---
 

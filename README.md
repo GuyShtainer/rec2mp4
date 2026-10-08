@@ -88,13 +88,10 @@ committed to, this repository** (`local/` is gitignored):
   [PokeDNA](https://github.com/GuyShtainer/PokeDNA)'s battle-record export, or
   cut from any 128 KiB save (bytes `0x1F000..0x1FFFF`).
 
-**Which local save is used:** the default `local/template.sav` now holds a copy
-of **`local/alt-saves/all-shiny.sav`** (post-game, Frontier Pass + Game Clear
-set, both save slots checksum-OK) — the save all validation ran with. The
-original EZ-Flash cart backup that first sat at that path turned out to be an
-**erased-flash image (every byte 0xFF — no save at all)**; a fresh cart re-dump
-is needed if that cart's real save is ever wanted. Full findings:
-`docs/research/save-check.md`.
+**Which save is used:** put your own post-game save at `local/template.sav`, or
+pass `--sav PATH`. It must have the Frontier Pass (post-Hall of Fame) and a valid
+checksum in at least one slot; `docs/research/save-check.md` shows how to check a
+dump before blaming the replay.
 
 ## Setup
 
