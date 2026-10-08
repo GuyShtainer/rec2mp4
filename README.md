@@ -78,10 +78,11 @@ Detail of what that covers:
   best treated as experimental; the **command line is the supported path**.
 
 The CI "mGBA bindings fetch + import (macos-latest)" job is advisory: the
-prebuilt macOS bindings link one specific brew ffmpeg ABI (`libavcodec.62`,
-ffmpeg 8), so the import fails on a runner whose brew ffmpeg is another major;
-on your own Mac, `brew install mgba ffmpeg` with a current ffmpeg is what the
-validated runs used.
+prebuilt macOS bindings (hanzi/libmgba-py 0.2.0-2) link one specific brew
+ffmpeg ABI, `libavcodec.62`, and brew's ffmpeg has since moved to
+`libavcodec.63`, so the import fails there until the bindings are rebuilt. On
+a Mac whose brew ffmpeg still provides `libavcodec.62` the import works; that
+is what the validated runs used.
 
 Not yet validated: Windows, non-US ROMs (unsupported by design — the RAM
 addresses are US-specific), link-battle records (none in the test set), and

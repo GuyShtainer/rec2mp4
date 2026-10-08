@@ -107,8 +107,8 @@ jobs:
     name: mGBA bindings fetch + import (${{ matrix.os }})
     timeout-minutes: 20
     # The macOS prebuilt _pylib.abi3.so is linked against one specific brew
-    # ffmpeg ABI (libavcodec.62 = ffmpeg 8); the runner's brew ffmpeg may be
-    # another major, so the macOS import smoke is ADVISORY (Windows is the
+    # ffmpeg ABI (libavcodec.62); brew's ffmpeg already ships libavcodec.63
+    # (seen 2026-10-08), so the macOS import smoke is ADVISORY (Windows is the
     # self-contained zip and stays blocking). The listing below says which
     # libavcodec the runner actually has when the import fails.
     continue-on-error: ${{ matrix.os == 'macos-latest' }}
