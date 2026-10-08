@@ -4,6 +4,14 @@
 
 Turn Pokémon Emerald **Battle Record** exports (`.rec`) into `.mp4` videos.
 
+**Where the `.rec` comes from:** [**PokeDNA**](https://github.com/GuyShtainer/PokeDNA),
+the on-cartridge GBA save editor (EZ-Flash Omega DE / EverDrive), reads the recorded
+Battle Frontier battle out of your Emerald save and exports it to the SD card as a
+`.rec` file with a `.txt` sidecar (your streak, play time, Frontier symbols). Copy
+that file to your PC, and rec2mp4 turns it into a video. PokeDNA and rec2mp4 are two
+halves of one workflow: record the battle on the cart, export it with PokeDNA,
+render it here.
+
 A `.rec` file is a raw dump of save **sector 31** (4096 bytes) — the Frontier Pass
 "Battle Record" that Emerald writes after a recordable Battle Frontier or link
 battle. It contains an RNG seed, both teams, and the raw per-player button-input
