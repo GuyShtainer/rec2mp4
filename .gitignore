@@ -31,3 +31,8 @@ docs/research/opponent-pov/
 
 # macOS
 .DS_Store
+
+# converter output folders and build products
+out2/
+# internal planning notes (local only)
+docs/BACKLOG.md
