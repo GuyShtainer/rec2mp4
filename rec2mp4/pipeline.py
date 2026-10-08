@@ -79,7 +79,9 @@ def _default_err(msg: object) -> None:
 
 # The interpreter that has the whole stack (Pillow + vendored mGBA + ffmpeg)
 # — named in every "install/relaunch here" message so the user can copy it.
-CONDA_PYTHON = "~/miniconda3/envs/rec2mp4/bin/python"
+# REC2MP4_PYTHON overrides it (e.g. a dedicated conda env); otherwise it is
+# whichever Python is running rec2mp4 right now.
+CONDA_PYTHON = os.environ.get("REC2MP4_PYTHON") or sys.executable
 
 
 def pillow_available() -> bool:

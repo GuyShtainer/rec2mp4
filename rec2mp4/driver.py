@@ -36,8 +36,12 @@ _VENDOR_DIR = Path(__file__).resolve().parent.parent / "vendor"
 _INSTALL_HELP = """\
 The mGBA Python bindings (hanzi/libmgba-py) are not installed. Install with:
 
-  ~/miniconda3/bin/conda create -y -n rec2mp4 python=3.13
-  ~/miniconda3/envs/rec2mp4/bin/python -m pip install pillow numpy
+  python tools/fetch_bindings.py        # one command, macOS / Windows / Linux
+
+or by hand on macOS (a dedicated env is tidy but not required):
+
+  conda create -y -n rec2mp4 python=3.13 && conda activate rec2mp4
+  python -m pip install pillow numpy
   mkdir -p {vendor}
   cd {vendor}
   curl -L -o libmgba-py.zip \\
@@ -49,7 +53,7 @@ The mGBA Python bindings (hanzi/libmgba-py) are not installed. Install with:
 
 (brew mgba 0.10.5 must be installed: `brew install mgba`.) Then run rec2mp4
 under that env's python:
-  ~/miniconda3/envs/rec2mp4/bin/python -m rec2mp4 ..."""
+  python -m rec2mp4 ..."""
 
 
 # gBattleOutcome values — B_OUTCOME_* in the decomp's

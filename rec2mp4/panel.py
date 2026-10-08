@@ -105,10 +105,8 @@ def _require_pil():
     except ImportError as exc:
         raise RuntimeError(
             "the side panel needs Pillow, which this Python does not have. "
-            "Install it in the rec2mp4 conda env:\n"
-            "  ~/miniconda3/envs/rec2mp4/bin/python "
-            "-m pip install pillow\n"
-            "(or into whatever Python you run rec2mp4 with), "
+            "Install it into the Python you run rec2mp4 with:\n"
+            "  python -m pip install pillow\n"
             "or convert with --panel off.") from exc
     return Image, ImageDraw, ImageFont
 
