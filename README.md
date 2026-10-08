@@ -58,6 +58,17 @@ Detail of what that covers:
   Not yet run on Windows/Linux; the asset-free half is covered by
   `tests/test_layout.py` on all three CI OSes.
 
+**Experimental and not working — do not rely on these:**
+
+- **The panel designer window** (`rec2mp4-designer`, `python -m rec2mp4.designer`,
+  the GUI's *Design panel…* button) — the visual, drag-and-drop editor for the
+  video's info panel. It opens and draws, but in practice editing a layout in it
+  does not work; it is a prototype kept in the tree for later. Make a layout
+  by writing the JSON by hand (see "Designing your own panel"), or stay with
+  `--panel` / `--layout default`, which are what the validated batch used.
+- **The desktop GUI** (`rec2mp4-gui`) is new, exercised on macOS only, and is
+  best treated as experimental; the **command line is the supported path**.
+
 Not yet validated: Windows, non-US ROMs (unsupported by design — the RAM
 addresses are US-specific), link-battle records (none in the test set), and
 Strategy B (save-free playback — see the roadmap note in
@@ -257,6 +268,10 @@ conversion still works: a warning is printed and videos are written
 without the panel. `--panel off` never touches Pillow.
 
 ### Designing your own panel — `--layout`, `rec2mp4-designer`
+
+> **The designer window is experimental and not working.** The `--layout` JSON
+> format below is supported and tested; the drag-and-drop editor that writes it
+> is not. Edit the JSON by hand or start from `--layout default`.
 
 The stacked panel above is one fixed arrangement. A **layout** replaces it
 with free-form geometry: information blocks you place and size yourself, on
@@ -541,6 +556,10 @@ with animations off (59.4 s) and on (73.6 s) reaches the same outcome with
 identical HP trajectories.
 
 ## GUI (desktop)
+
+> **Experimental.** The GUI wraps the same pipeline but has only been exercised on
+> macOS, and its *Design panel…* button opens the non-working designer. Use the
+> command line for anything that matters.
 
 A minimal desktop front-end over the exact same pipeline, built on stdlib
 `tkinter` — **zero extra dependencies** (python.org and conda installers on
