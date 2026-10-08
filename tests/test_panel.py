@@ -408,11 +408,10 @@ def test_panel_render() -> bool:
             ok(False, "render_panel must raise without Pillow")
         except RuntimeError as exc:
             ok("pillow" in str(exc).lower()
-               and "miniconda3/envs/rec2mp4" in str(exc),
-               f"Pillow error must name the conda env: {exc}")
+               and "pip install pillow" in str(exc),
+               f"Pillow error must say how to install it: {exc}")
         print("   SKIP: Pillow not importable here — render smoke needs "
-              "the rec2mp4 conda env "
-              "(~/miniconda3/envs/rec2mp4/bin/python); "
+              "a Python with Pillow (python -m pip install pillow); "
               "verified the clear no-Pillow error instead")
         return False
     from PIL import Image
@@ -521,15 +520,15 @@ def test_pipeline_no_emulator():
        "ConvertSettings defaults wrong")
 
     # stack probes: pillow_available agrees with a real import; stack_status
-    # reports the keys front-ends rely on; pillow_hint names the conda env.
+    # reports the keys front-ends rely on; pillow_hint says how to install Pillow.
     ok(pipeline.pillow_available() == _pil_available(),
        "pillow_available() disagrees with a direct import")
     st = pipeline.stack_status()
     for key in ("pillow", "emulator", "ffmpeg", "ok", "interpreter"):
         ok(key in st, f"stack_status missing {key!r}: {st}")
     ok(st["pillow"] == _pil_available(), "stack_status pillow flag wrong")
-    ok("miniconda3/envs/rec2mp4" in pipeline.pillow_hint(),
-       "pillow_hint must name the rec2mp4 conda env")
+    ok("pip install pillow" in pipeline.pillow_hint(),
+       "pillow_hint must say how to install Pillow")
 
     tmp = Path(tempfile.mkdtemp(prefix="rec2mp4-pipe-"))
     logs, errs = [], []
