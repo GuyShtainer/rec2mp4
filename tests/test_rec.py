@@ -21,6 +21,7 @@ import glob
 import os
 import struct
 import sys
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -316,6 +317,62 @@ def test_inject(data: bytes, sav: bytes):
     print("   sector 31 byte-equal, rest untouched, RecError paths OK")
 
 
+def test_extract(data: bytes, sav: bytes):
+    print("-- extract() + the .sav input path of the CLI")
+    full = rec.inject(data, sav)
+    ok(rec.extract(full) == data, "extract() did not return the injected sector 31")
+    ok(rec.parse(rec.extract(full)) == rec.parse(data), "extracted record parses differently")
+    try:
+        rec.extract(full[:0x10000])
+        ok(False, "extract() accepted a 64 KiB dump")
+    except rec.RecError as exc:
+        ok("64 KiB" in str(exc), f"64 KiB refusal message unclear: {exc}")
+    erased = b"\xff" * len(sav)                  # erased flash: no record
+    ok(rec.validate(rec.extract(erased)) != [], "an erased sector 31 validated as a record")
+
+    import io, tempfile
+    from contextlib import redirect_stdout, redirect_stderr
+    from rec2mp4.__main__ import main as cli
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        savp = d / "POKEMON_EMER_BPEE00.sav"
+        savp.write_bytes(full)
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = cli([str(savp), "--extract-only"])
+        recp = d / "POKEMON_EMER_BPEE00.rec"
+        ok(rc == 0, f"--extract-only on a save with a record returned {rc}: {err.getvalue()}")
+        ok(recp.exists() and recp.read_bytes() == data,
+           "--extract-only did not write <stem>.rec with the sector-31 bytes")
+        ok("extracted sector 31" in out.getvalue(), "no 'extracted' line printed")
+        with redirect_stdout(out), redirect_stderr(err):
+            rc2 = cli([str(savp), "--extract-only"])
+        ok(rc2 == 0 and "already exported" in out.getvalue(),
+           "an identical existing .rec was not reused")
+        # a different .rec in the way is never overwritten
+        other = bytearray(data); other[rec.STRUCT_OFF + 100] ^= 0x55; fix_checksum(other)
+        recp.write_bytes(bytes(other))
+        with redirect_stdout(out), redirect_stderr(err):
+            rc3 = cli([str(savp), "--extract-only"])
+        ok(rc3 == 1 and recp.read_bytes() == bytes(other),
+           "a different existing .rec was overwritten or the clash was not reported")
+        # --rec-dir routes the export elsewhere; the directory is created
+        with redirect_stdout(out), redirect_stderr(err):
+            rc4 = cli([str(savp), "--extract-only", "--rec-dir", str(d / "recs")])
+        ok(rc4 == 0 and (d / "recs" / "POKEMON_EMER_BPEE00.rec").read_bytes() == data,
+           "--rec-dir did not receive the export")
+        # a save with no record fails loudly and writes nothing
+        empty = d / "fresh.sav"; empty.write_bytes(erased)
+        with redirect_stdout(out), redirect_stderr(err):
+            rc5 = cli([str(empty), "--extract-only"])
+        ok(rc5 == 1 and not (d / "fresh.rec").exists() and "no usable Battle Record" in err.getvalue(),
+           "a record-less save was not refused cleanly")
+        # a folder input picks up the .sav and summarizes it with --info-only
+        with redirect_stdout(out), redirect_stderr(err):
+            rc6 = cli([str(d / "recs"), "--info-only"])
+        ok(rc6 == 0, f"--info-only on the exported .rec folder returned {rc6}")
+
+
 def test_patch_options(data: bytes):
     print("-- patch_options()")
     opt_off = rec.STRUCT_OFF + 1279
@@ -394,6 +451,7 @@ def main():
     test_patch_options(reference)
     if sav is not None:
         test_inject(reference, sav)
+        test_extract(reference, sav)
     if os.environ.get("REC2MP4_REQUIRE_ASSETS") and (synthetic or skipped):
         print("SKIPPED, not passed (REC2MP4_REQUIRE_ASSETS=1): "
               f"{_checks} check(s) ran but real assets were "

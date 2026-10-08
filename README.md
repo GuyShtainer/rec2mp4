@@ -163,6 +163,12 @@ Run from the project root (or `pip install -e .` for a `rec2mp4` command):
 # Inspect a record — no emulator, ROM or save required
 python3 -m rec2mp4 local/recs/GUYA_27-07-2026_08-54.rec --info-only
 
+# Straight from a save: a 128 KiB .sav whose sector 31 holds a record is
+# accepted anywhere a .rec is. The record is exported first as
+# '<save stem>.rec' next to the save (or into --rec-dir), then converted.
+python3 -m rec2mp4 POKEMON_EMER_BPEE00.sav
+python3 -m rec2mp4 POKEMON_EMER_BPEE00.sav --extract-only      # just the .rec, no emulator
+
 # Convert a single record. Output name carries the battle's data, e.g.
 #   out/GUYA_27-07-2026_08-54 - Battle Arena Open vs SAILOR MAXWELL.mp4
 # plus a matching .json sidecar (see "Output names & the JSON sidecar")

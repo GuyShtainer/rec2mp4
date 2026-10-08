@@ -38,8 +38,19 @@ def _build_parser() -> argparse.ArgumentParser:
                     "in a headless mGBA and encode them to .mp4.",
     )
     p.add_argument("input",
-                   help=".rec file, or a folder — every *.rec inside it "
-                        "(sorted) is converted")
+                   help=".rec file, a 128 KiB .sav whose sector 31 holds a "
+                        "Battle Record (the record is extracted to a .rec "
+                        "first, see --rec-dir), or a folder — every *.rec "
+                        "and *.sav inside it (sorted) is converted")
+    p.add_argument("--rec-dir", default=None, metavar="DIR",
+                   help="where to write the .rec extracted from a .sav input "
+                        "(default: next to the save, as '<save stem>.rec'). "
+                        "An existing identical .rec is reused; a different "
+                        "one is never overwritten")
+    p.add_argument("--extract-only", action="store_true",
+                   help="extract the record from each .sav input to a .rec "
+                        "and stop — no emulator, ffmpeg or ROM needed. "
+                        "(.rec inputs are just summarized)")
     p.add_argument("-o", "--outdir", default=None, metavar="DIR",
                    help="output folder for .mp4 files "
                         f"(default: {DEFAULT_OUTDIR})")
@@ -189,13 +200,77 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _collect_recs(arg: str) -> list[Path]:
-    """input argument -> list of .rec paths (empty list = usage error)."""
+    """input argument -> list of .rec / .sav paths (empty list = usage error)."""
     p = Path(arg)
     if p.is_dir():
-        return sorted(p.glob("*.rec"))
+        return sorted(p.glob("*.rec")) + sorted(p.glob("*.sav"))
     if p.is_file():
         return [p]
     return []
+
+
+def _is_save(p: Path) -> bool:
+    """A .sav by name, or any non-.rec file big enough to hold sector 31."""
+    if p.suffix.lower() == ".rec":
+        return False
+    if p.suffix.lower() == ".sav":
+        return True
+    try:
+        return p.stat().st_size >= rec.SAV_MIN_SIZE
+    except OSError:
+        return False
+
+
+def _extract_saves(paths: list[Path], rec_dir: str | None
+                   ) -> tuple[list[Path], list[tuple[str, str, str]]]:
+    """Replace every .sav in `paths` by the .rec extracted from its sector 31.
+
+    The .rec is written as '<save stem>.rec' next to the save (or into
+    rec_dir). An existing identical file is reused; a different one is left
+    alone and the save is reported FAILED instead of clobbering it. Returns
+    (paths with saves swapped for their .rec, summary rows for the saves).
+    """
+    out: list[Path] = []
+    rows: list[tuple[str, str, str]] = []
+    for p in paths:
+        if not _is_save(p):
+            out.append(p)
+            continue
+        try:
+            sav = p.read_bytes()
+            data = rec.extract(sav)
+        except (OSError, rec.RecError) as exc:
+            print(f"{p.name}: {exc}", file=sys.stderr)
+            rows.append((p.name, "FAILED", str(exc)))
+            continue
+        errors = rec.validate(data)
+        if errors:
+            detail = "no usable Battle Record in sector 31: " + "; ".join(errors)
+            print(f"{p.name}: {detail}", file=sys.stderr)
+            rows.append((p.name, "FAILED", detail))
+            continue
+        target = (Path(rec_dir) if rec_dir else p.parent) / (p.stem + ".rec")
+        if target.exists():
+            if target.read_bytes() == data:
+                print(f"{p.name}: sector 31 already exported as {target}")
+            else:
+                detail = (f"refusing to overwrite {target} — it holds a "
+                          "different record (move it or use --rec-dir)")
+                print(f"{p.name}: {detail}", file=sys.stderr)
+                rows.append((p.name, "FAILED", detail))
+                continue
+        else:
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+            except OSError as exc:
+                print(f"{p.name}: cannot write {target}: {exc}", file=sys.stderr)
+                rows.append((p.name, "FAILED", f"cannot write {target}: {exc}"))
+                continue
+            print(f"{p.name}: extracted sector 31 -> {target}")
+        rows.append((p.name, "OK", f"record exported to {target.name}"))
+        out.append(target)
+    return out, rows
 
 
 def _info_only_one(rp: Path) -> tuple[str, str, str]:
@@ -258,9 +333,22 @@ def main(argv: list[str] | None = None) -> int:
 
     rec_paths = _collect_recs(args.input)
     if not rec_paths:
-        print(f"error: {args.input!r} is not a .rec file or a folder "
-              "containing .rec files", file=sys.stderr)
+        print(f"error: {args.input!r} is not a .rec/.sav file or a folder "
+              "containing .rec/.sav files", file=sys.stderr)
         return 2
+    n_inputs = len(rec_paths)
+    rec_paths, save_rows = _extract_saves(rec_paths, args.rec_dir)
+    save_failures = sum(1 for r in save_rows if r[1] != "OK")
+    if args.extract_only:
+        for n, status, detail in save_rows:
+            print(f"{n:<40}  {status:<7}  {detail}")
+        n_ok = len(save_rows) - save_failures
+        print(f"\n{n_ok}/{len(save_rows)} save(s) exported, "
+              f"{save_failures} failed.")
+        return 1 if save_failures or not save_rows else 0
+    if not rec_paths:
+        print("error: no usable record among the inputs", file=sys.stderr)
+        return 1
 
     # ------------------------------------------------------------------
     # Batch preflight (skipped entirely for --info-only, which must work
@@ -298,6 +386,9 @@ def main(argv: list[str] | None = None) -> int:
     # ------------------------------------------------------------------
     results: list[tuple[str, str, str]] = []    # (name, status, detail)
     failures = 0
+    # Saves whose record could not be exported are already counted as failed.
+    results.extend(r for r in save_rows if r[1] != "OK")
+    failures += save_failures
 
     if args.info_only:
         for rp in rec_paths:
@@ -349,14 +440,14 @@ def main(argv: list[str] | None = None) -> int:
     # ------------------------------------------------------------------
     # Batch summary
     # ------------------------------------------------------------------
-    if len(rec_paths) > 1:
+    if n_inputs > 1:
         width = max(len(n) for n, _, _ in results)
         print("\n" + "=" * 72)
         for n, status, detail in results:
             print(f"{n:<{width}}  {status:<7}  {detail}")
         print("=" * 72)
     ok = len(results) - failures
-    print(f"\n{ok}/{len(rec_paths)} record(s) OK, {failures} failed.")
+    print(f"\n{ok}/{len(results)} record(s) OK, {failures} failed.")
     return 1 if failures else 0
 
 

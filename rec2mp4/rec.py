@@ -406,6 +406,23 @@ def inject(rec: bytes, sav: bytes) -> bytes:
     return bytes(out)
 
 
+def extract(sav: bytes) -> bytes:
+    """Return sector 31 (0x1F000..0x1FFFF) of a save image: the Battle Record
+    exactly as a .rec export holds it.
+
+    The caller's buffer is never modified. Raises RecError if the image is
+    smaller than 128 KiB (a 64 KiB dump has no sector 31). The result is NOT
+    validated here -- an erased or never-recorded sector comes back as the
+    0xFF fill and fails validate() with a sentinel error, which is the
+    caller's cue to say "this save holds no record".
+    """
+    if len(sav) < SAV_MIN_SIZE:
+        raise RecError(f"save too small: {len(sav)} bytes — a 128 KiB "
+                       f"(>= 0x{SAV_MIN_SIZE:X}-byte) .sav is required; a "
+                       "64 KiB dump has no sector 31")
+    return bytes(sav[SAV_SECTOR31_OFF:SAV_SECTOR31_OFF + SECTOR_SIZE])
+
+
 def patch_options(rec: bytes, animations: bool | None = None,
                   text_speed: int | None = None) -> bytes:
     """Return a copy of the record with its presentation options overridden.
